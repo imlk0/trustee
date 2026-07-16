@@ -9,7 +9,9 @@ use std::sync::Arc;
 use strum::EnumString;
 use thiserror::Error;
 
+#[cfg(feature = "fs")]
 pub mod opa;
+pub mod opa_in_memory;
 
 #[derive(Error, Debug)]
 pub enum PolicyError {
@@ -54,10 +56,12 @@ pub enum PolicyError {
 #[derive(Debug, EnumString, Deserialize)]
 #[strum(ascii_case_insensitive)]
 pub enum PolicyEngineType {
+    #[cfg(feature = "fs")]
     OPA,
 }
 
 impl PolicyEngineType {
+    #[cfg(feature = "fs")]
     pub fn to_policy_engine(
         &self,
         work_dir: &Path,

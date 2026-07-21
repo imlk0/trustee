@@ -15,7 +15,8 @@ impl BuiltinRvps {
     }
 }
 
-#[async_trait]
+#[cfg_attr(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown"), async_trait(?Send))]
+#[cfg_attr(not(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown")), async_trait)]
 impl RvpsApi for BuiltinRvps {
     async fn verify_and_extract(&mut self, message: &str) -> Result<()> {
         self.rvps.verify_and_extract(message).await?;

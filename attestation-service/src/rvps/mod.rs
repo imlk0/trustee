@@ -38,7 +38,8 @@ type Result<T> = std::result::Result<T, RvpsError>;
 /// store reference values from it.
 /// * `get_digests` gets trusted digests by the artifact's name.
 /// * `delete_reference_value` is responsible for deleting a reference value.
-#[async_trait::async_trait]
+#[cfg_attr(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown"), async_trait::async_trait(?Send))]
+#[cfg_attr(not(all(target_arch = "wasm32", target_vendor = "unknown", target_os = "unknown")), async_trait::async_trait)]
 pub trait RvpsApi {
     /// Verify the given message and register the reference value included.
     async fn verify_and_extract(&mut self, message: &str) -> Result<()>;

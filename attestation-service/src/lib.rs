@@ -9,7 +9,7 @@ pub mod policy_engine;
 pub mod rvps;
 pub mod token;
 
-use crate::token::AttestationTokenBroker;
+use crate::{challenge::Challenger, token::AttestationTokenBroker};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -187,6 +187,7 @@ pub struct AttestationService {
     _config: Config,
     rvps: Box<dyn RvpsApi + Send + Sync>,
     token_broker: Box<dyn AttestationTokenBroker + Send + Sync>,
+    challenger: Box<dyn Challenger + Send + Sync>,
 }
 
 #[derive(serde::Serialize, Debug, Clone)]
@@ -197,9 +198,21 @@ struct Jwk {
 }
 
 impl AttestationService {
-    /// Create a new Attestation Service instance.
+    /// Create a new Attestation Service instance from a parsed [`Config`].
+    ///
+    /// Config-file / CLI entry point, kept for backward compatibility. It
+    /// constructs the RVPS and token-broker *instances* from the config,
+    /// picks a [`Challenger`] (an [`FsChallengeKey`] at the configured path,
+    /// or the built-in default path when unset), and assembles them via
+    /// [`Self::from_components`]. Pure-lib / wasm consumers that do not want
+    /// to depend on [`Config`] should call [`Self::from_components`] directly
+    /// with their own component instances.
     #[cfg(feature = "fs")]
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
+        use crate::challenge::FsChallengeKey;
+
+        // Historical `new()` created the work dir at construction time. Kept
+        // as a standalone mkdir purely for behavior parity.
         if !config.work_dir.as_path().exists() {
             fs::create_dir_all(&config.work_dir)
                 .await
@@ -209,13 +222,18 @@ impl AttestationService {
         let rvps = rvps::initialize_rvps_client(&config.rvps_config)
             .await
             .map_err(ServiceError::Rvps)?;
-
         let token_broker = config.attestation_token_broker.to_token_broker()?;
+
+        let challenger: Box<dyn Challenger + Send + Sync> = match &config.challenge_key_path {
+            Some(path) => Box::new(FsChallengeKey::new(path.clone())),
+            None => Box::new(FsChallengeKey::new(FsChallengeKey::default_path())),
+        };
 
         Ok(Self {
             _config: config,
             rvps,
             token_broker,
+            challenger,
         })
     }
 
@@ -379,14 +397,10 @@ impl AttestationService {
             .await
     }
 
-    /// Filesystem path of the RSA private key used to sign and verify
-    /// attestation challenge (nonce) tokens. Falls back to the built-in
-    /// default when not set in the config.
-    pub fn challenge_key_path(&self) -> std::path::PathBuf {
-        self._config
-            .challenge_key_path
-            .clone()
-            .unwrap_or_else(challenge::default_challenge_key_path)
+    /// Borrow the underlying [`Challenger`] used to issue/verify challenge
+    /// (nonce) tokens.
+    pub fn challenger(&self) -> &dyn Challenger {
+        self.challenger.as_ref()
     }
 
     pub async fn generate_challenge(
@@ -395,7 +409,7 @@ impl AttestationService {
         tee_parameters: Option<String>,
     ) -> Result<String> {
         match tee {
-            None => challenge::generate_common_challenge(&self.challenge_key_path()),
+            None => self.challenger.generate_challenge().await,
             Some(t) => {
                 self.generate_supplemental_challenge(t, tee_parameters.unwrap_or_default())
                     .await

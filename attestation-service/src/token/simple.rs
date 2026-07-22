@@ -126,13 +126,13 @@ impl Default for Configuration {
 
 pub trait SignerProvider: Send + Sync {
     fn private_key(&self) -> &RsaPrivateKey;
-    fn cert_chain(&self) -> Option<&[CertificateDer<'static>]>;
+    fn cert_chain(&self) -> Option<Result<Vec<CertificateDer<'static>>>>;
     fn cert_url(&self) -> Option<&str>;
     /// The signer's certificate-chain raw PEM bytes, read lazily from the
     /// configured `cert_path` on each call (not cached at construction).
     /// `None` when no `cert_path` is configured. Ephemeral signers return
     /// `None`. The broker forwards this through `signer_cert_content`.
-    fn cert_pem_raw(&self) -> Result<Option<Vec<u8>>>;
+    fn cert_pem_raw(&self) -> Option<Result<Vec<u8>>>;
 }
 
 /// Signer resolved from a `SignerConfig` (native/serde path). Reads
@@ -141,7 +141,6 @@ pub trait SignerProvider: Send + Sync {
 #[cfg(feature = "fs")]
 struct ConfigSigner {
     private_key: RsaPrivateKey,
-    cert_chain: Option<Vec<CertificateDer<'static>>>,
     cert_url: Option<String>,
     // Kept so `cert_pem_raw` can re-read the file lazily; not the cached PEM.
     cert_path: Option<String>,
@@ -156,21 +155,8 @@ impl ConfigSigner {
             .or_else(|_| RsaPrivateKey::from_pkcs1_pem(&pem_data))
             .context("Parse Token Signer private key failed")?;
 
-        let cert_chain = signer
-            .cert_path
-            .as_ref()
-            .map(|cert_path| -> Result<Vec<CertificateDer<'static>>> {
-                let pem_cert_chain = std::fs::read_to_string(cert_path)
-                    .context("Read Token Signer cert file failed")?;
-                let chain: Result<Vec<_>, rustls_pki_types::pem::Error> =
-                    CertificateDer::pem_slice_iter(pem_cert_chain.as_bytes()).collect();
-                chain.context("Invalid PEM certificate chain")
-            })
-            .transpose()?;
-
         Ok(Self {
             private_key,
-            cert_chain,
             cert_url: signer.cert_url,
             cert_path: signer.cert_path,
         })
@@ -182,27 +168,31 @@ impl SignerProvider for ConfigSigner {
     fn private_key(&self) -> &RsaPrivateKey {
         &self.private_key
     }
-    fn cert_chain(&self) -> Option<&[CertificateDer<'static>]> {
-        self.cert_chain.as_deref()
+    fn cert_chain(&self) -> Option<Result<Vec<CertificateDer<'static>>>> {
+        self.cert_path
+            .as_ref()
+            .map(|cert_path| -> Result<Vec<CertificateDer<'static>>> {
+                let pem_cert_chain = std::fs::read_to_string(cert_path)
+                    .context("Read Token Signer cert file failed")?;
+                let chain: Result<Vec<_>, rustls_pki_types::pem::Error> =
+                    CertificateDer::pem_slice_iter(pem_cert_chain.as_bytes()).collect();
+                chain.context("Invalid PEM certificate chain")
+            })
     }
     fn cert_url(&self) -> Option<&str> {
         self.cert_url.as_deref()
     }
-    fn cert_pem_raw(&self) -> Result<Option<Vec<u8>>> {
-        match &self.cert_path {
-            Some(path) => {
-                use std::io::Read as _;
-
-                // Read certificate from file
-                let mut file = std::fs::File::open(path)
-                    .map_err(|e| anyhow!("Failed to open certificate file: {}", e))?;
-                let mut content = Vec::new();
-                file.read_to_end(&mut content)
-                    .map_err(|e| anyhow!("Failed to read certificate file: {}", e))?;
-                Ok(Some(content))
-            }
-            None => Ok(None),
-        }
+    fn cert_pem_raw(&self) -> Option<Result<Vec<u8>>> {
+        self.cert_path.as_ref().map(|path| {
+            use std::io::Read as _;
+            // Read certificate from file
+            let mut file = std::fs::File::open(path)
+                .map_err(|e| anyhow!("Failed to open certificate file: {}", e))?;
+            let mut content = Vec::new();
+            file.read_to_end(&mut content)
+                .map_err(|e| anyhow!("Failed to read certificate file: {}", e))?;
+            Ok(content)
+        })
     }
 }
 
@@ -225,14 +215,14 @@ impl SignerProvider for EphemeralSigner {
     fn private_key(&self) -> &RsaPrivateKey {
         &self.private_key
     }
-    fn cert_chain(&self) -> Option<&[CertificateDer<'static>]> {
+    fn cert_chain(&self) -> Option<Result<Vec<CertificateDer<'static>>>> {
         None
     }
     fn cert_url(&self) -> Option<&str> {
         None
     }
-    fn cert_pem_raw(&self) -> Result<Option<Vec<u8>>> {
-        Ok(None)
+    fn cert_pem_raw(&self) -> Option<Result<Vec<u8>>> {
+        None
     }
 }
 
@@ -303,7 +293,7 @@ impl SimpleAttestationTokenBroker {
         };
 
         jwk.x5u = self.signer.cert_url().map(str::to_owned);
-        if let Some(cert_chain) = self.signer.cert_chain() {
+        if let Some(cert_chain) = self.signer.cert_chain().transpose()? {
             let mut x5c = Vec::new();
             for cert in cert_chain {
                 x5c.push(URL_SAFE_NO_PAD.encode(cert));
@@ -463,7 +453,7 @@ impl AttestationTokenBroker for SimpleAttestationTokenBroker {
             .map_err(Error::from)
     }
 
-    async fn signer_cert_content(&self) -> Result<Option<Vec<u8>>> {
+    async fn signer_cert_content(&self) -> Option<Result<Vec<u8>>> {
         self.signer.cert_pem_raw()
     }
 

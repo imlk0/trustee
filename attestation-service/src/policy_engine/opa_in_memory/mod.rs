@@ -21,10 +21,6 @@ pub struct InMemoryPolicyEngine {
 }
 
 impl InMemoryPolicyEngine {
-    pub fn new() -> Self {
-        Self { policies: RwLock::new(HashMap::new()) }
-    }
-
     /// Build an engine with a default policy preloaded, mirroring `opa::OPA::new`
     /// which writes the default policy to `{dir}/{default_policy_id}` on disk.
     /// The policy is stored under the stem of `default_policy_id` (`.rego`
@@ -35,16 +31,16 @@ impl InMemoryPolicyEngine {
         let stem = default_policy_id.trim_end_matches(".rego");
         let mut policies = HashMap::new();
         policies.insert(stem.to_string(), default_policy.as_bytes().to_vec());
-        Self { policies: RwLock::new(policies) }
+        Self {
+            policies: RwLock::new(policies),
+        }
     }
 
     fn is_valid_policy_id(policy_id: &str) -> bool {
-        policy_id.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        policy_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
     }
-}
-
-impl Default for InMemoryPolicyEngine {
-    fn default() -> Self { Self::new() }
 }
 
 #[async_trait]
@@ -60,21 +56,28 @@ impl PolicyEngine for InMemoryPolicyEngine {
         let policy = policies
             .get(policy_id)
             .map(|b| b.as_slice())
-            .ok_or_else(|| PolicyError::ReadPolicyFileFailed(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("policy {policy_id} not found"),
-            )))?;
-        let policy = std::str::from_utf8(policy)
-            .map_err(|e| PolicyError::InvalidPolicy(e.into()))?;
+            .ok_or_else(|| {
+                PolicyError::ReadPolicyFileFailed(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("policy {policy_id} not found"),
+                ))
+            })?;
+        let policy =
+            std::str::from_utf8(policy).map_err(|e| PolicyError::InvalidPolicy(e.into()))?;
 
         let mut engine = regorus::Engine::new();
         engine
             .add_policy(policy_id.to_string(), policy.to_string())
             .map_err(PolicyError::LoadPolicyFailed)?;
-        let data = regorus::Value::from_json_str(data)
-            .map_err(PolicyError::JsonSerializationFailed)?;
-        engine.add_data(data).map_err(PolicyError::LoadReferenceDataFailed)?;
-        engine.set_input_json(input).context("set input").map_err(PolicyError::SetInputDataFailed)?;
+        let data =
+            regorus::Value::from_json_str(data).map_err(PolicyError::JsonSerializationFailed)?;
+        engine
+            .add_data(data)
+            .map_err(PolicyError::LoadReferenceDataFailed)?;
+        engine
+            .set_input_json(input)
+            .context("set input")
+            .map_err(PolicyError::SetInputDataFailed)?;
 
         let policy_hash = {
             let mut h = Sha384::new();
@@ -89,7 +92,10 @@ impl PolicyEngine for InMemoryPolicyEngine {
                 rules_result.insert(rule, v);
             }
         }
-        Ok(EvaluationResult { rules_result, policy_hash })
+        Ok(EvaluationResult {
+            rules_result,
+            policy_hash,
+        })
     }
 
     async fn set_policy(&self, policy_id: String, policy: String) -> Result<(), PolicyError> {
@@ -99,9 +105,12 @@ impl PolicyEngine for InMemoryPolicyEngine {
         let bytes = URL_SAFE_NO_PAD.decode(policy)?;
         // validate it compiles as rego
         {
-            let src = std::str::from_utf8(&bytes).map_err(|e| PolicyError::InvalidPolicy(e.into()))?;
+            let src =
+                std::str::from_utf8(&bytes).map_err(|e| PolicyError::InvalidPolicy(e.into()))?;
             let mut engine = regorus::Engine::new();
-            engine.add_policy(policy_id.clone(), src.to_string()).map_err(PolicyError::InvalidPolicy)?;
+            engine
+                .add_policy(policy_id.clone(), src.to_string())
+                .map_err(PolicyError::InvalidPolicy)?;
         }
         let mut policies = self.policies.write().await;
         policies.insert(policy_id, bytes);
@@ -121,9 +130,12 @@ impl PolicyEngine for InMemoryPolicyEngine {
 
     async fn get_policy(&self, policy_id: String) -> Result<String, PolicyError> {
         let policies = self.policies.read().await;
-        let bytes = policies.get(&policy_id).ok_or_else(|| PolicyError::ReadPolicyFileFailed(
-            std::io::Error::new(std::io::ErrorKind::NotFound, format!("policy {policy_id} not found")),
-        ))?;
+        let bytes = policies.get(&policy_id).ok_or_else(|| {
+            PolicyError::ReadPolicyFileFailed(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("policy {policy_id} not found"),
+            ))
+        })?;
         Ok(URL_SAFE_NO_PAD.encode(bytes))
     }
 
@@ -163,7 +175,10 @@ mod tests {
     async fn evaluate_uses_in_memory_policy() {
         let eng = InMemoryPolicyEngine::new();
         eng.set_policy("p".into(), allow_policy()).await.unwrap();
-        let res = eng.evaluate("{}", "{}", "p", vec!["allow".into()]).await.unwrap();
+        let res = eng
+            .evaluate("{}", "{}", "p", vec!["allow".into()])
+            .await
+            .unwrap();
         assert!(res.rules_result.contains_key("allow"));
     }
 }

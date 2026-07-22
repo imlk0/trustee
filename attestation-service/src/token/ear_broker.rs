@@ -41,6 +41,8 @@ pub const DEFAULT_PROFILE: &str = "tag:github.com,2024:confidential-containers/T
 pub const DEFAULT_DEVELOPER_NAME: &str = "https://confidentialcontainers.org";
 
 const DEFAULT_POLICY_DIR: &str = concatcp!(DEFAULT_TOKEN_WORK_DIR, "/ear/policies");
+pub const DEFAULT_POLICY: &str = include_str!("ear_default_policy_cpu.rego");
+pub const DEFAULT_POLICY_ID: &str = "default.rego";
 
 /// Part 2 — signer resolution spec (native/serde path only). Renamed from
 /// `TokenSignerConfig`; field set unchanged.
@@ -297,8 +299,8 @@ impl EarAttestationTokenBroker {
     pub fn from_config(config: Configuration) -> Result<Self> {
         let policy_engine = PolicyEngineType::OPA.to_policy_engine(
             Path::new(&config.policy_dir),
-            include_str!("ear_default_policy_cpu.rego"),
-            "default.rego",
+            DEFAULT_POLICY,
+            DEFAULT_POLICY_ID,
         )?;
         info!("Loading default AS policy \"default.rego\"");
 
@@ -721,11 +723,7 @@ mod tests {
         // broker fall back to an ephemeral key. Proves issue() works with no
         // fs feature, no policy_dir, no SignerConfig.
         let policy_engine: Arc<dyn PolicyEngine> = PolicyEngineType::OPAInMemory
-            .to_policy_engine(
-                Path::new("/"),
-                include_str!("ear_default_policy_cpu.rego"),
-                "default.rego",
-            )
+            .to_policy_engine(Path::new("/"), DEFAULT_POLICY, DEFAULT_POLICY_ID)
             .unwrap();
         let broker = EarAttestationTokenBroker::from_components(
             TokenBrokerSettings::default(),

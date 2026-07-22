@@ -21,6 +21,9 @@ use rsa::pkcs8::DecodePrivateKey;
 use rsa::signature::Signer;
 use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
+#[cfg(feature = "fs")]
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use serde_variant::to_variant_name;
@@ -28,8 +31,6 @@ use sha2::Sha384;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use x509_cert::der::{DecodePem, Encode};
-use x509_cert::Certificate;
 
 use crate::policy_engine::{PolicyEngine, PolicyEngineType};
 use crate::token::{AttestationTokenBroker, DEFAULT_TOKEN_WORK_DIR};
@@ -125,7 +126,7 @@ impl Default for Configuration {
 
 pub trait SignerProvider: Send + Sync {
     fn private_key(&self) -> &RsaPrivateKey;
-    fn cert_chain(&self) -> Option<&[Certificate]>;
+    fn cert_chain(&self) -> Option<&[CertificateDer<'static>]>;
     fn cert_url(&self) -> Option<&str>;
     /// The signer's certificate-chain raw PEM bytes, read lazily from the
     /// configured `cert_path` on each call (not cached at construction).
@@ -140,7 +141,7 @@ pub trait SignerProvider: Send + Sync {
 #[cfg(feature = "fs")]
 struct ConfigSigner {
     private_key: RsaPrivateKey,
-    cert_chain: Option<Vec<Certificate>>,
+    cert_chain: Option<Vec<CertificateDer<'static>>>,
     cert_url: Option<String>,
     // Kept so `cert_pem_raw` can re-read the file lazily; not the cached PEM.
     cert_path: Option<String>,
@@ -158,23 +159,12 @@ impl ConfigSigner {
         let cert_chain = signer
             .cert_path
             .as_ref()
-            .map(|cert_path| -> Result<Vec<Certificate>> {
+            .map(|cert_path| -> Result<Vec<CertificateDer<'static>>> {
                 let pem_cert_chain = std::fs::read_to_string(cert_path)
                     .context("Read Token Signer cert file failed")?;
-                let mut chain = Vec::new();
-
-                for pem in pem_cert_chain.split("-----END CERTIFICATE-----") {
-                    let trimmed = format!("{}\n-----END CERTIFICATE-----", pem.trim());
-                    if !trimmed.starts_with("-----BEGIN CERTIFICATE-----") {
-                        continue;
-                    }
-                    // x509-cert's DecodePem expects a single PEM block; the split
-                    // above already isolates one. Use the Label-aware decoder.
-                    let cert = Certificate::from_pem(trimmed.as_bytes())
-                        .context("Invalid PEM certificate chain")?;
-                    chain.push(cert);
-                }
-                Ok(chain)
+                let chain: Result<Vec<_>, rustls_pki_types::pem::Error> =
+                    CertificateDer::pem_slice_iter(pem_cert_chain.as_bytes()).collect();
+                chain.context("Invalid PEM certificate chain")
             })
             .transpose()?;
 
@@ -192,7 +182,7 @@ impl SignerProvider for ConfigSigner {
     fn private_key(&self) -> &RsaPrivateKey {
         &self.private_key
     }
-    fn cert_chain(&self) -> Option<&[Certificate]> {
+    fn cert_chain(&self) -> Option<&[CertificateDer<'static>]> {
         self.cert_chain.as_deref()
     }
     fn cert_url(&self) -> Option<&str> {
@@ -235,7 +225,7 @@ impl SignerProvider for EphemeralSigner {
     fn private_key(&self) -> &RsaPrivateKey {
         &self.private_key
     }
-    fn cert_chain(&self) -> Option<&[Certificate]> {
+    fn cert_chain(&self) -> Option<&[CertificateDer<'static>]> {
         None
     }
     fn cert_url(&self) -> Option<&str> {
@@ -316,8 +306,7 @@ impl SimpleAttestationTokenBroker {
         if let Some(cert_chain) = self.signer.cert_chain() {
             let mut x5c = Vec::new();
             for cert in cert_chain {
-                let der = cert.to_der()?;
-                x5c.push(URL_SAFE_NO_PAD.encode(der));
+                x5c.push(URL_SAFE_NO_PAD.encode(cert));
             }
             jwk.x5c = Some(x5c);
         }

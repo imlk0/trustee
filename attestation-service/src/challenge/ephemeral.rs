@@ -23,12 +23,6 @@ impl EphemeralChallengeKey {
     }
 }
 
-impl Default for EphemeralChallengeKey {
-    fn default() -> Self {
-        Self::new().expect("EphemeralChallengeKey generation must not fail")
-    }
-}
-
 #[cfg_attr(
     all(
         target_arch = "wasm32",

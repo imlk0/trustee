@@ -283,12 +283,12 @@ impl SimpleAttestationTokenBroker {
         settings: TokenBrokerSettings,
         signer: Arc<dyn SignerProvider>,
         policy_engine: Arc<dyn PolicyEngine>,
-    ) -> Result<Self> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             settings,
             signer,
             policy_engine,
-        })
+        }
     }
 }
 

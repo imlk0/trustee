@@ -10,7 +10,7 @@ pub mod rvps;
 pub mod token;
 
 use crate::token::AttestationTokenBroker;
-pub use challenge::{Challenger, EphemeralChallengeKey};
+pub use challenge::{Challenger, EphemeralJwtChallenger};
 
 use anyhow::{anyhow, bail, Context, Result};
 use canon_json::CanonicalFormatter;
@@ -186,14 +186,14 @@ impl AttestationService {
     ///
     /// Config-file / CLI entry point, kept for backward compatibility. It
     /// constructs the RVPS and token-broker *instances* from the config,
-    /// picks a [`Challenger`] (an [`FsChallengeKey`] at the configured path,
+    /// picks a [`Challenger`] (an [`FsJwtChallenger`] at the configured path,
     /// or the built-in default path when unset), and assembles them via
     /// [`Self::from_components`]. Pure-lib / wasm consumers that do not want
     /// to depend on [`Config`] should call [`Self::from_components`] directly
     /// with their own component instances.
     #[cfg(feature = "fs")]
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
-        use crate::challenge::FsChallengeKey;
+        use crate::challenge::FsJwtChallenger;
 
         // Historical `new()` created the work dir at construction time. Kept
         // as a standalone mkdir purely for behavior parity.
@@ -209,8 +209,8 @@ impl AttestationService {
         let token_broker = config.attestation_token_broker.to_token_broker()?;
 
         let challenger: Box<dyn Challenger + Send + Sync> = match config.challenge_key_path {
-            Some(path) => Box::new(FsChallengeKey::new(path)),
-            None => Box::new(FsChallengeKey::new(FsChallengeKey::default_path())),
+            Some(path) => Box::new(FsJwtChallenger::new(path)),
+            None => Box::new(FsJwtChallenger::new(FsJwtChallenger::default_path())),
         };
 
         Ok(Self::from_components(rvps, token_broker, challenger))

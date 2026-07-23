@@ -8,7 +8,7 @@ use rsa::{
     RsaPrivateKey,
 };
 
-use crate::challenge::RSA_KEY_BITS;
+use super::RSA_KEY_BITS;
 
 use super::{build_challenge_json, verify_jwt};
 
@@ -24,14 +24,18 @@ fn default_challenge_key_path() -> PathBuf {
 
 /// [`super::Challenger`] backed by an RSA private key on the filesystem.
 ///
+/// JWT-based (RS384) challenge key — the issued JWT itself is the nonce, so
+/// see [`super::build_challenge_json`] for why the `exp` claim gives freshness
+/// across replicas without synchronizing every signed token.
+///
 /// The key is read lazily on each call (and, on the `fs` feature, generated
 /// on first use) at the configured `path`. Native / config-file compatibility
 /// path — the AS default until a caller opts into an in-memory impl.
-pub struct FsChallengeKey {
+pub struct FsJwtChallenger {
     path: PathBuf,
 }
 
-impl FsChallengeKey {
+impl FsJwtChallenger {
     /// Construct with an explicit on-disk key path.
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -63,7 +67,7 @@ impl FsChallengeKey {
     )),
     async_trait::async_trait
 )]
-impl super::Challenger for FsChallengeKey {
+impl crate::Challenger for FsJwtChallenger {
     async fn generate_challenge(&self) -> Result<String> {
         let key = ensure_keypair(self.path())?;
         build_challenge_json(&key)
@@ -114,13 +118,13 @@ mod tests {
 
     use super::*;
 
-    /// `FsChallengeKey`: sign + verify round-trip on a temp dir, pinning the
+    /// `FsJwtChallenger`: sign + verify round-trip on a temp dir, pinning the
     /// on-disk PKCS#8 format this module writes.
     #[tokio::test]
     async fn fs_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let key_file = tmp.path().join("key.pem");
-        let c = FsChallengeKey::new(key_file.clone());
+        let c = FsJwtChallenger::new(key_file.clone());
 
         let challenge_json = c.generate_challenge().await.expect("generate");
         let outer: Value = serde_json::from_str(&challenge_json).expect("outer json");
@@ -150,14 +154,14 @@ mod tests {
         );
     }
 
-    /// A second `FsChallengeKey` instance on the same path must verify a token
+    /// A second `FsJwtChallenger` instance on the same path must verify a token
     /// the first issued — the key is persisted, not regenerated per call.
     #[tokio::test]
     async fn fs_persisted_across_instances() {
         let tmp = tempfile::tempdir().unwrap();
         let key_file = tmp.path().join("key.pem");
 
-        let issuer = FsChallengeKey::new(key_file.clone());
+        let issuer = FsJwtChallenger::new(key_file.clone());
         let challenge_json = issuer.generate_challenge().await.expect("generate");
         let outer: Value = serde_json::from_str(&challenge_json).expect("outer json");
         let jwt = outer["extra-params"]["jwt"]
@@ -165,7 +169,7 @@ mod tests {
             .expect("jwt")
             .to_string();
 
-        let verifier = FsChallengeKey::new(key_file);
+        let verifier = FsJwtChallenger::new(key_file);
         verifier
             .verify_challenge_and_extract_nonce_b64url(&jwt)
             .await

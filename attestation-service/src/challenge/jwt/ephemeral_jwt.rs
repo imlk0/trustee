@@ -2,19 +2,25 @@ use anyhow::Result;
 use rand::rngs::OsRng;
 use rsa::RsaPrivateKey;
 
+use crate::Challenger;
+
 use super::{build_challenge_json, verify_jwt, RSA_KEY_BITS};
 
 /// [`super::Challenger`] backed by a random RSA key generated once at
 /// construction and held purely in memory for the process lifetime.
 ///
+/// JWT-based (RS384) challenge key — the issued JWT itself is the nonce, so
+/// see [`super::build_challenge_json`] for why the `exp` claim gives freshness
+/// across replicas without synchronizing every signed token.
+///
 /// Wasm- and pure-lib-friendly; the default challenger on fs-free builds.
 /// Each process restart gets a fresh key, so challenge tokens issued by one
 /// instance cannot be verified by another.
-pub struct EphemeralChallengeKey {
+pub struct EphemeralJwtChallenger {
     key: RsaPrivateKey,
 }
 
-impl EphemeralChallengeKey {
+impl EphemeralJwtChallenger {
     /// Generate a fresh 2048-bit RSA key with `OsRng`.
     pub fn new() -> Result<Self> {
         let mut rng = OsRng;
@@ -39,7 +45,7 @@ impl EphemeralChallengeKey {
     )),
     async_trait::async_trait
 )]
-impl super::Challenger for EphemeralChallengeKey {
+impl Challenger for EphemeralJwtChallenger {
     async fn generate_challenge(&self) -> Result<String> {
         build_challenge_json(&self.key)
     }
@@ -59,10 +65,10 @@ mod tests {
 
     use super::*;
 
-    /// `EphemeralChallengeKey`: sign + verify round-trip, no filesystem.
+    /// `EphemeralJwtChallenger`: sign + verify round-trip, no filesystem.
     #[tokio::test]
     async fn ephemeral_roundtrip() {
-        let c = EphemeralChallengeKey::new().expect("new ephemeral challenger");
+        let c = EphemeralJwtChallenger::new().expect("new ephemeral challenger");
 
         let challenge_json = c.generate_challenge().await.expect("generate");
         let outer: Value = serde_json::from_str(&challenge_json).expect("outer json");

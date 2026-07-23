@@ -279,6 +279,17 @@ impl AttestationService {
         }
 
         for verification_request in verification_requests {
+            if let Some(RuntimeData::Structured(v)) = &verification_request.runtime_data {
+                if let Some(jwt) = v.get("challenge_token").and_then(|x| x.as_str()) {
+                    // Verify the token, but do not modify the runtime_data content
+                    let _ = self
+                        .challenger
+                        .verify_challenge_and_extract_nonce_b64url(jwt)
+                        .await
+                        .context("verify challenge_token failed")?;
+                }
+            }
+
             let verifier = verifier::to_verifier(&verification_request.tee)?;
 
             let (report_data, runtime_data_claims) = parse_runtime_data(

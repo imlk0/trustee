@@ -184,18 +184,6 @@ pub async fn attestation(
 
         let runtime_data = match attestation_request.runtime_data {
             Some(RuntimeData::Structured(v)) => {
-                if let Some(jwt) = v.get("challenge_token").and_then(|x| x.as_str()) {
-                    // 验证 token，但不修改 runtime_data 内容
-                    let _ = cocoas
-                        .read()
-                        .await
-                        .challenger()
-                        .verify_challenge_and_extract_nonce_b64url(jwt)
-                        .await
-                        .map_err(|e| {
-                            Error::Unauthorized(anyhow!("verify challenge_token failed: {e}"))
-                        })?;
-                }
                 Some(parse_runtime_data(RuntimeData::Structured(v))?)
             }
             Some(RuntimeData::Raw(raw)) => Some(parse_runtime_data(RuntimeData::Raw(raw))?),

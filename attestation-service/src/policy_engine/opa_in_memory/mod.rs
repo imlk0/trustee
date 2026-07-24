@@ -3,7 +3,6 @@
 //! filesystem access. Selected by `PolicyEngineType::InMemory`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -27,10 +26,10 @@ impl InMemoryPolicyEngine {
     /// stripped), matching how `opa::OPA::evaluate` looks up `{policy_id}.rego`.
     /// This lets a broker's default policy flow (`evaluate(..., "default", ...)`)
     /// succeed without any filesystem access.
-    pub fn with_default_policy(default_policy: &str, default_policy_id: &str) -> Self {
+    pub fn with_raw_default_policy(raw_default_policy: &str, default_policy_id: &str) -> Self {
         let stem = default_policy_id.trim_end_matches(".rego");
         let mut policies = HashMap::new();
-        policies.insert(stem.to_string(), default_policy.as_bytes().to_vec());
+        policies.insert(stem.to_string(), raw_default_policy.as_bytes().to_vec());
         Self {
             policies: RwLock::new(policies),
         }
@@ -155,16 +154,15 @@ impl PolicyEngine for InMemoryPolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
+    const RAW_ALLOW_POLICY: &str = "package policy\ndefault allow = true";
     fn allow_policy() -> String {
-        URL_SAFE_NO_PAD.encode(b"package policy\ndefault allow = true")
+        URL_SAFE_NO_PAD.encode(RAW_ALLOW_POLICY)
     }
 
     #[tokio::test]
     async fn set_get_list_delete_roundtrip() {
-        let eng = InMemoryPolicyEngine::new();
-        eng.set_policy("test".into(), allow_policy()).await.unwrap();
+        let eng = InMemoryPolicyEngine::with_raw_default_policy(RAW_ALLOW_POLICY, "test");
         assert_eq!(eng.list_policies().await.unwrap().len(), 1);
         assert_eq!(eng.get_policy("test".into()).await.unwrap(), allow_policy());
         eng.delete_policy("test".into()).await.unwrap();
@@ -172,11 +170,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_policy_then_get_roundtrip() {
+        // Covers the set_policy -> get_policy path (the roundtrip above only
+        // exercises with_default_policy). Verifies raw rego in == raw rego out.
+        let eng = InMemoryPolicyEngine::with_raw_default_policy(RAW_ALLOW_POLICY, "default");
+        eng.set_policy("test".into(), allow_policy().into())
+            .await
+            .unwrap();
+        let got = eng.get_policy("test".into()).await.unwrap();
+        assert_eq!(got, allow_policy());
+        // setting again overwrites cleanly
+        eng.set_policy("test".into(), allow_policy().into())
+            .await
+            .unwrap();
+        assert_eq!(eng.get_policy("test".into()).await.unwrap(), allow_policy());
+    }
+
+    #[tokio::test]
     async fn evaluate_uses_in_memory_policy() {
-        let eng = InMemoryPolicyEngine::new();
-        eng.set_policy("p".into(), allow_policy()).await.unwrap();
+        let eng = InMemoryPolicyEngine::with_raw_default_policy(RAW_ALLOW_POLICY, "test");
         let res = eng
-            .evaluate("{}", "{}", "p", vec!["allow".into()])
+            .evaluate("{}", "{}", "test", vec!["allow".into()])
             .await
             .unwrap();
         assert!(res.rules_result.contains_key("allow"));

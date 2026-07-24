@@ -9,6 +9,19 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde_json::{json, Value};
 use sha2::Sha384;
 
+#[cfg(not(all(
+    target_arch = "wasm32",
+    target_vendor = "unknown",
+    target_os = "unknown"
+)))]
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(all(
+    target_arch = "wasm32",
+    target_vendor = "unknown",
+    target_os = "unknown"
+))]
+use web_time::{SystemTime, UNIX_EPOCH};
+
 mod ephemeral;
 #[cfg(feature = "fs")]
 mod fs;
@@ -70,8 +83,8 @@ fn build_challenge_json(key: &RsaPrivateKey) -> Result<String> {
     let header_b64 = URL_SAFE_NO_PAD.encode(header_string.as_bytes());
 
     // claims with 5-minute expiry
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .context("time error")?
         .as_secs();
     let exp = now + 5 * 60;
@@ -130,8 +143,8 @@ fn verify_jwt(token: &str, key: &RsaPrivateKey) -> Result<String> {
     let v: Value = serde_json::from_slice(&payload).context("invalid JWT payload json")?;
 
     // exp
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .context("time error")?
         .as_secs() as i64;
     let exp = v

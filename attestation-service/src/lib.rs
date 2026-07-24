@@ -10,7 +10,7 @@ pub mod rvps;
 pub mod token;
 
 use crate::token::AttestationTokenBroker;
-pub use challenge::{Challenger, EphemeralJwtChallenger};
+pub use challenge::{Challenger, EphemeralJwtChallenger, LocalNonceChallenger};
 
 use anyhow::{anyhow, bail, Context, Result};
 use canon_json::CanonicalFormatter;

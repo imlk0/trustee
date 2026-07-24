@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 pub use serde_json::Value;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use sm3::Sm3;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use strum::{AsRefStr, Display, EnumString};
 use thiserror::Error;
 #[cfg(feature = "fs")]
@@ -278,18 +278,25 @@ impl AttestationService {
             bail!("No verification requests provided.")
         }
 
-        for verification_request in verification_requests {
+        // Verify challenge token
+        let mut challenge_tokens = HashSet::new();
+        for verification_request in &verification_requests {
             if let Some(RuntimeData::Structured(v)) = &verification_request.runtime_data {
-                if let Some(jwt) = v.get("challenge_token").and_then(|x| x.as_str()) {
-                    // Verify the token, but do not modify the runtime_data content
-                    let _ = self
-                        .challenger
-                        .verify_challenge_and_extract_nonce_b64url(jwt)
-                        .await
-                        .context("verify challenge_token failed")?;
+                if let Some(challenge_token) = v.get("challenge_token").and_then(|x| x.as_str()) {
+                    challenge_tokens.insert(challenge_token);
                 }
             }
+        }
+        for challenge_token in challenge_tokens {
+            // Verify the token, but do not modify the runtime_data content
+            let _ = self
+                .challenger
+                .verify_challenge_and_extract_nonce_b64url(challenge_token)
+                .await
+                .context("verify challenge_token failed")?;
+        }
 
+        for verification_request in verification_requests {
             let verifier = verifier::to_verifier(&verification_request.tee)?;
 
             let (report_data, runtime_data_claims) = parse_runtime_data(

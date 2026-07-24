@@ -925,6 +925,7 @@ curl -k -X POST http://<gateway-host>:<port>/api/attestation-service/challenge \
     - 从本接口响应中读取 `extra-params.jwt`（ChallengeToken，JWT 字符串）。
     - 在后续调用 `/attestation-service/attestation` 时，将该 token 放入 `runtime_data` 的结构化 JSON 中，字段名为 `challenge_token`，不再放置于请求头。
     - AS 会验证该 token 的签名与有效期（`exp`，签发端设置为 5 分钟）。仅当 `runtime_data` 中存在 `challenge_token` 且验证失败时，AS 才会直接返回统一错误；若字段不存在或 `runtime_data` 为原始类型，则按原逻辑继续处理。AS 只做验证，不修改来访 `runtime_data` 内容。
+    - **非 JWT challenger 变体（如单实例本地 nonce challenger）：** 当 AS 配置为不带 JWT 的 challenger 时，challenge 响应只包含 `{"nonce": <b64>}`，没有 `extra-params.jwt`。此时 nonce 本身即是一次性 token，客户端应将顶层 `nonce` 字段的值放入 `runtime_data` 的 `challenge_token` 字段（而非从 `extra-params.jwt` 读取）。AS 在 verify 时从内存集合中一次性消费该 token，重放会被拒绝。该模式仅在单实例部署下有效（nonce 集合不跨副本共享，进程重启即丢失）。
 
 ```shell
 curl -k -X POST http://<gateway-host>:<port>/api/attestation-service/attestation \

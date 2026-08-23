@@ -101,6 +101,8 @@ impl PolicyEngine for OPA {
             reference_value_resolver,
             #[cfg(feature = "policy-artifact-server")]
             self.artifact_server_client.clone(),
+            // fs-backed OPA has no caller-injected host-await functions.
+            None,
         )
         .await
     }

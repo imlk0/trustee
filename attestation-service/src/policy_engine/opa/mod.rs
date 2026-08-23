@@ -107,7 +107,7 @@ fn policy_uses_legacy_reference(policy: &str) -> Result<bool, PolicyError> {
     target_vendor = "unknown",
     target_os = "unknown"
 ))]
-type RegoVmHostAwaitFunction = Box<
+pub type RegoVmHostAwaitFunction = Arc<
     dyn Fn(
             regorus::Value,
         )
@@ -121,7 +121,7 @@ type RegoVmHostAwaitFunction = Box<
     target_vendor = "unknown",
     target_os = "unknown"
 )))]
-type RegoVmHostAwaitFunction = Box<
+pub type RegoVmHostAwaitFunction = Arc<
     dyn Fn(
             /* argument */ regorus::Value,
         )
@@ -134,7 +134,7 @@ type RegoVmHostAwaitFunction = Box<
 fn query_reference_value_extension(
     reference_value_resolver: Arc<ReferenceValueResolver>,
 ) -> RegoVmHostAwaitFunction {
-    Box::new(move |argument| {
+    Arc::new(move |argument| {
         let reference_value_resolver = reference_value_resolver.clone();
         Box::pin(async move {
             let key = argument
@@ -185,7 +185,7 @@ fn query_reference_value_extension(
 fn query_artifact_server_extension(
     artifact_server_client: Arc<artifact_resolve_sdk::Client>,
 ) -> RegoVmHostAwaitFunction {
-    Box::new(move |argument| {
+    Arc::new(move |argument| {
         let artifact_server_client = artifact_server_client.clone();
         Box::pin(async move {
             use artifact_resolve_sdk::{Measurement, ReleaseManifest};
@@ -245,6 +245,7 @@ async fn common_evaluate(
     #[cfg(feature = "policy-artifact-server")] artifact_server_client: Arc<
         artifact_resolve_sdk::Client,
     >,
+    extra_host_await_functions: Option<Vec<(String, RegoVmHostAwaitFunction)>>,
 ) -> Result<EvaluationResult, PolicyError> {
     // Legacy policies read reference values from data.reference; fetch them via
     // the resolver. All other policies get an empty data document.
@@ -275,6 +276,18 @@ async fn common_evaluate(
             "query_artifact_server".to_string(),
             query_artifact_server_extension(artifact_server_client),
         );
+    }
+
+    // Merge caller-injected host-await functions after the built-ins. This is the
+    // generic injection point that lets a downstream crate (e.g. TNG) supply
+    // arbitrary host functions callable from rego — notably `crypto.sha256`
+    // (a dotted key), since regorus 0.11 ships no `crypto.*` builtins by design.
+    // User functions are inserted last so a key colliding with a built-in is
+    // overridden by the caller's explicit choice.
+    if let Some(extras) = extra_host_await_functions {
+        for (key, function) in extras {
+            regovm_host_await_functions.insert(key, function);
+        }
     }
 
     evaluate_with_regovm(
@@ -677,7 +690,7 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
         let mut functions = HashMap::<String, RegoVmHostAwaitFunction>::new();
         functions.insert(
             "echo".to_string(),
-            Box::new(|argument| Box::pin(async move { Ok::<_, PolicyError>(argument) })),
+            Arc::new(|argument| Box::pin(async move { Ok::<_, PolicyError>(argument) })),
         );
         let id = regorus::Value::String(regorus::Rc::from("echo"));
         let arg = regorus::Value::String(regorus::Rc::from("payload"));
@@ -700,7 +713,7 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
     #[test]
     fn build_extensions_generates_host_await_wrapper_per_registered_key() {
         let make = || -> RegoVmHostAwaitFunction {
-            Box::new(|_a: regorus::Value| {
+            Arc::new(|_a: regorus::Value| {
                 Box::pin(async { Ok::<_, PolicyError>(regorus::Value::Null) })
             })
         };
@@ -720,7 +733,7 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
 
     // Host-await closure that always returns a fixed value, ignoring its argument.
     fn fixed_value_extension(value: regorus::Value) -> RegoVmHostAwaitFunction {
-        Box::new(move |_argument| {
+        Arc::new(move |_argument| {
             let value = value.clone();
             Box::pin(async move { Ok(value) })
         })
@@ -729,7 +742,7 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
     // Host-await closure mapping a string argument to a number ("a"->1, "b"->2),
     // else null. Used to verify the VM forwards the policy argument to the host.
     fn lookup_extension() -> RegoVmHostAwaitFunction {
-        Box::new(move |argument| {
+        Arc::new(move |argument| {
             Box::pin(async move {
                 let key = argument.as_string().map_err(|e| {
                     PolicyError::EvalPolicyFailed(anyhow!("lookup arg not a string: {e}"))
@@ -746,7 +759,7 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
     // Host-await closure that always fails, to exercise error propagation from a
     // suspended host call back up through evaluate_with_regovm.
     fn failing_extension() -> RegoVmHostAwaitFunction {
-        Box::new(move |_argument| {
+        Arc::new(move |_argument| {
             Box::pin(async move {
                 Err(PolicyError::EvalPolicyFailed(anyhow!(
                     "async function failed"

@@ -26,6 +26,11 @@ pub struct OPAInMemory {
     /// built-in. Each entry's key becomes a rego-callable function name. `None`
     /// keeps the built-ins-only behaviour. See [`with_extra_extension_functions`].
     extra_extension_functions: Option<Vec<(String, super::ExtensionFunction)>>,
+    /// Compiled-RVM-program cache shared across `evaluate` calls, keyed by
+    /// policy content hash. A repeated appraisal of the same policy skips
+    /// `Engine` construction, policy parsing and compilation entirely and only
+    /// runs the per-rule VM. Cleared on `set_policy`/`delete_policy`.
+    program_cache: Arc<super::ProgramCache>,
 }
 
 impl OPAInMemory {
@@ -55,6 +60,7 @@ impl OPAInMemory {
                     .map_err(PolicyError::ArtifactServerClientCreationFailed)?,
             ),
             extra_extension_functions: None,
+            program_cache: Arc::new(super::ProgramCache::default()),
         })
     }
 
@@ -131,6 +137,9 @@ impl PolicyEngine for OPAInMemory {
             // lets `evaluate(&self)` hand the injected functions to
             // `common_evaluate` without moving out of `&self`.
             self.extra_extension_functions.clone(),
+            // Shared program cache: the first appraisal of a policy pays the
+            // compile; subsequent appraisals of the same content hit the cache.
+            &self.program_cache,
         )
         .await
     }
@@ -153,6 +162,11 @@ impl PolicyEngine for OPAInMemory {
                 .add_policy(policy_id.clone(), src.to_string())
                 .map_err(PolicyError::InvalidPolicy)?;
         }
+        // Policy content changed (or was added): drop cached programs so the
+        // next evaluation recompiles against the new source. Keyed by content
+        // hash, so a no-op overwrite of identical content could keep its entry,
+        // but clearing is simple, correct, and `set_policy` is a rare admin op.
+        self.program_cache.write().await.clear();
         let mut policies = self.policies.write().await;
         policies.insert(policy_id, bytes);
         Ok(())
@@ -187,6 +201,8 @@ impl PolicyEngine for OPAInMemory {
         if policy_id == "default" {
             return Err(PolicyError::CannotDeleteDefaultPolicy);
         }
+        // A deleted policy's cached programs must not outlive it.
+        self.program_cache.write().await.clear();
         let mut policies = self.policies.write().await;
         policies.remove(&policy_id);
         Ok(())

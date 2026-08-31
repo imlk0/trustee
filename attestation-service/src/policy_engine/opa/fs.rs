@@ -19,6 +19,11 @@ pub struct OPA {
 
     #[cfg(feature = "policy-artifact-server")]
     artifact_server_client: Arc<artifact_resolve_sdk::Client>,
+
+    /// Compiled-RVM-program cache shared across `evaluate` calls, keyed by
+    /// policy content hash. Cleared on `set_policy`/`delete_policy`. Cloned
+    /// cheaply (the `Arc` is shared, not the cache contents).
+    program_cache: Arc<super::ProgramCache>,
 }
 
 impl OPA {
@@ -56,12 +61,16 @@ impl OPA {
             Ok(Self {
                 policy_dir_path,
                 artifact_server_client: Arc::new(client),
+                program_cache: Arc::new(super::ProgramCache::default()),
             })
         }
 
         #[cfg(not(feature = "policy-artifact-server"))]
         {
-            Ok(Self { policy_dir_path })
+            Ok(Self {
+                policy_dir_path,
+                program_cache: Arc::new(super::ProgramCache::default()),
+            })
         }
     }
 }
@@ -103,6 +112,7 @@ impl PolicyEngine for OPA {
             self.artifact_server_client.clone(),
             // fs-backed OPA has no caller-injected extension functions.
             None,
+            &self.program_cache,
         )
         .await
     }
@@ -127,6 +137,10 @@ impl PolicyEngine for OPA {
                 .add_policy(policy_id.clone(), policy_content)
                 .map_err(PolicyError::InvalidPolicy)?;
         }
+
+        // Policy content changed: drop cached programs so the next evaluation
+        // recompiles against the new source on disk.
+        self.program_cache.write().await.clear();
 
         let mut policy_file_path = PathBuf::from(
             &self
@@ -200,6 +214,9 @@ impl PolicyEngine for OPA {
             )));
         }
 
+        // A deleted policy's cached programs must not outlive it.
+        self.program_cache.write().await.clear();
+
         std::fs::remove_file(policy_file_path).map_err(PolicyError::IOError)?;
 
         Ok(())
@@ -257,6 +274,7 @@ mod tests {
             artifact_server_client: Arc::new(
                 artifact_resolve_sdk::Client::new(DEFAULT_ARTIFACT_SERVER_ADDRESS).unwrap(),
             ),
+            program_cache: Arc::new(crate::policy_engine::opa::ProgramCache::default()),
         };
         let default_policy_id = "ear_default_policy_cpu".to_string();
 

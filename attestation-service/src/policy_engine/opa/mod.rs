@@ -172,6 +172,19 @@ pub type ExtensionFunction = Arc<
         + Sync,
 >;
 
+/// Compiled RVM programs for one policy, keyed by rule name. Only rules the
+/// policy actually defines are present (undefined rules are skipped at compile
+/// time, preserving origin/main's `not a valid rule path` -> skip contract).
+type RulePrograms = HashMap<String, Arc<regorus::rvm::Program>>;
+
+/// Cross-evaluation program cache: `policy_hash` -> per-rule `Arc<Program>`s.
+/// Keyed by content hash so a changed policy (different hash) naturally misses
+/// and recompiles; `set_policy`/`delete_policy` clear it to bound memory under
+/// policy churn. The cached `Program` excludes per-eval `data`/`input` (those
+/// are set on the VM at run time) and the host-await wrapper is constant per
+/// engine instance, so a `policy_hash` key is sufficient.
+pub type ProgramCache = tokio::sync::RwLock<HashMap<String, RulePrograms>>;
+
 #[cfg(feature = "policy-rvps")]
 fn query_reference_value_extension(
     reference_value_resolver: Arc<ReferenceValueResolver>,
@@ -278,6 +291,11 @@ fn query_artifact_server_extension(
     })
 }
 
+// Eight parameters, each a distinct concern (policy source, input, id, rule
+// list, RVPS resolver, optional artifact client, caller-injected extension
+// functions, cross-evaluation program cache); bundling would obscure the
+// call sites rather than clarify them.
+#[allow(clippy::too_many_arguments)]
 async fn common_evaluate(
     policy: String,
     input: String,
@@ -288,6 +306,7 @@ async fn common_evaluate(
         artifact_resolve_sdk::Client,
     >,
     extra_extension_functions: Option<Vec<(String, ExtensionFunction)>>,
+    program_cache: &ProgramCache,
 ) -> Result<EvaluationResult, PolicyError> {
     // Legacy policies read reference values from data.reference; fetch them via
     // the resolver. All other policies get an empty data document.
@@ -333,7 +352,12 @@ async fn common_evaluate(
 
     // Dispatch to the selected backend. Exactly one of the two features is on
     // (enforced by the compile_error guards at the top of this file), so only
-    // one branch is compiled.
+    // one branch is compiled. The `program_cache` is only read by the RVM
+    // backend (it caches compiled `regorus::rvm::Program`s); under the
+    // interpreter backend the param is inert, so reference it once to keep the
+    // shared signature warning-free without a cfg on the param itself.
+    #[cfg(feature = "regorus-interpreter")]
+    let _ = program_cache;
     #[cfg(feature = "regorus-regovm")]
     return evaluate_with_regovm(
         policy,
@@ -342,6 +366,7 @@ async fn common_evaluate(
         evaluation_rules,
         data,
         extension_functions,
+        program_cache,
     )
     .await;
     #[cfg(feature = "regorus-interpreter")]
@@ -364,6 +389,7 @@ async fn evaluate_with_regovm(
     evaluation_rules: Vec<String>,
     data: String,
     extension_functions: HashMap<String, ExtensionFunction>,
+    program_cache: &ProgramCache,
 ) -> Result<EvaluationResult, PolicyError> {
     let policy_hash = {
         let mut hasher = sha2::Sha384::new();
@@ -387,18 +413,17 @@ async fn evaluate_with_regovm(
     let input_value =
         regorus::Value::from_json_str(&input).map_err(PolicyError::SetInputDataFailed)?;
 
-    let mut rules_result = std::collections::HashMap::new();
-    for rule in &evaluation_rules {
-        // regorus rejects a bare rule name with "not a valid rule path"; use the full data.policy path.
-        let entry_point = format!("data.policy.{rule}");
-        let cp = {
-            // Build the engine per rule (mirroring the convenience API's
-            // behaviour) but with rego.v0 mode enabled, so legacy
-            // `allow { ... }` policies saved before the rego.v1 migration are
-            // still accepted. The free `regorus::compile_policy_with_entrypoint`
-            // helper ignores the dialect: it constructs its own `Engine::new()`
-            // (rego.v1) and never calls `set_rego_v0`, so legacy policies fail to
-            // parse there. Use `Engine::compile_with_entrypoint` directly.
+    // C (program cache): a hit skips Engine construction, policy parsing and
+    // compilation entirely — only the per-rule VM runs. A miss builds the
+    // engine once (A: hoisted out of the rule loop) and compiles each
+    // requested rule, skipping rules the policy does not define (origin/main
+    // `not a valid rule path` -> skip contract, preserved here and in the
+    // cached map's absence for that rule).
+    let programs: RulePrograms = {
+        let cached = program_cache.read().await.get(&policy_hash).cloned();
+        if let Some(m) = cached {
+            m
+        } else {
             let mut engine = regorus::Engine::new();
             engine.set_rego_v0(true);
             engine
@@ -412,23 +437,45 @@ async fn evaluate_with_regovm(
                     .add_policy(EXTENSIONS_WRAPPER_MODULE_ID.to_string(), wrapper.clone())
                     .map_err(PolicyError::LoadPolicyFailed)?;
             }
-            match engine.compile_with_entrypoint(&Rc::from(entry_point.clone())) {
-                Ok(cp) => cp,
-                Err(e) if e.to_string().contains("not a valid rule path") => {
-                    debug!("Policy `{policy_id}` does not check {rule}");
-                    continue;
-                }
-                Err(e) => return Err(PolicyError::LoadPolicyFailed(e)),
+
+            let mut compiled: RulePrograms = HashMap::new();
+            for rule in &evaluation_rules {
+                // regorus rejects a bare rule name with "not a valid rule
+                // path"; use the full data.policy path. See [`common_evaluate`].
+                let entry_point = format!("data.policy.{rule}");
+                let cp = match engine.compile_with_entrypoint(&Rc::from(entry_point.clone())) {
+                    Ok(cp) => cp,
+                    Err(e) if e.to_string().contains("not a valid rule path") => {
+                        debug!("Policy `{policy_id}` does not check {rule}");
+                        continue;
+                    }
+                    Err(e) => return Err(PolicyError::LoadPolicyFailed(e)),
+                };
+                let program = Compiler::compile_from_policy(&cp, &[entry_point.as_str()])
+                    .map_err(|e| PolicyError::LoadPolicyFailed(e.into()))?;
+                compiled.insert(rule.clone(), program);
             }
+            program_cache
+                .write()
+                .await
+                .insert(policy_hash.clone(), compiled.clone());
+            compiled
+        }
+    };
+
+    let mut rules_result = std::collections::HashMap::new();
+    for rule in &evaluation_rules {
+        // Rules absent from `programs` were skipped (policy does not define
+        // them) — preserve origin/main's skip behavior on cache hits too.
+        let Some(program) = programs.get(rule) else {
+            continue;
         };
 
         // Lower the CompiledPolicy to a Program, then load it onto a fresh VM.
-        // RegoVM::new_with_policy stores the policy but never loads a program, so
-        // execute() returns Undefined — do not use it.
-        let program = Compiler::compile_from_policy(&cp, &[entry_point.as_str()])
-            .map_err(|e| PolicyError::LoadPolicyFailed(e.into()))?;
+        // RegoVM::new_with_policy stores the policy but never loads a program,
+        // so execute() returns Undefined — do not use it.
         let mut vm = regorus::rvm::RegoVM::new();
-        vm.load_program(program);
+        vm.load_program(program.clone());
         vm.set_data(data_value.clone())
             .map_err(|e| PolicyError::LoadReferenceDataFailed(e.into()))?;
         vm.set_input(input_value.clone());
@@ -1046,6 +1093,12 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
             "{ext}"
         );
     }
+    // A fresh, empty program cache for `evaluate_with_regovm` tests. Each test
+    // gets its own so cached programs never leak across cases.
+    #[cfg(feature = "regorus-regovm")]
+    fn fresh_program_cache() -> ProgramCache {
+        ProgramCache::default()
+    }
 
     // Extension closure that always returns a fixed value, ignoring its argument.
     #[cfg(feature = "regorus-regovm")]
@@ -1111,6 +1164,7 @@ allow if {
             vec!["allow".to_string()],
             "{}".to_string(),
             functions,
+            &fresh_program_cache(),
         )
         .await
         .unwrap();
@@ -1142,6 +1196,7 @@ allow if {
             vec!["allow".to_string()],
             "{}".to_string(),
             functions,
+            &fresh_program_cache(),
         )
         .await
         .unwrap();
@@ -1172,6 +1227,7 @@ allow if {
             vec!["allow".to_string()],
             "{}".to_string(),
             functions,
+            &fresh_program_cache(),
         )
         .await
         .unwrap();
@@ -1201,9 +1257,734 @@ allow if {
             vec!["allow".to_string()],
             "{}".to_string(),
             functions,
+            &fresh_program_cache(),
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("async function failed"), "{err}");
+    }
+
+    // Pins origin/main's "skip missing rule" contract: a policy that defines
+    // only some of the requested rules must evaluate successfully, with the
+    // undefined rules simply ABSENT from the result — not a hard error. Both
+    // the old interpreter (`eval_rule` + catch `not a valid rule path`) and the
+    // current `evaluate_with_regovm` preserve this; any optimization of
+    // `evaluate_with_regovm` (hoist, program cache, etc.) MUST preserve it too.
+    // See the `eval_bench` module for why multi-entry compile was rejected: it
+    // would turn this skip into a whole-compile failure.
+    #[cfg(all(feature = "regorus-regovm", feature = "policy-rvps"))]
+    #[tokio::test]
+    async fn evaluate_skips_rules_not_defined_in_policy() {
+        let policy = r#"package policy
+import rego.v1
+default executables := 3
+default hardware := 2
+"#;
+        let mut functions = HashMap::<String, ExtensionFunction>::default();
+        functions.insert(
+            "query_reference_value".to_string(),
+            query_reference_value_extension(crate::rvps::test_resolver(
+                std::collections::HashMap::new(),
+            )),
+        );
+        let result = evaluate_with_regovm(
+            policy.to_string(),
+            "{}".to_string(),
+            "partial".to_string(),
+            vec![
+                "executables".to_string(),
+                "hardware".to_string(),
+                "configuration".to_string(), // not defined -> must be skipped
+                "file_system".to_string(),   // not defined -> must be skipped
+            ],
+            "{}".to_string(),
+            functions,
+            &fresh_program_cache(),
+        )
+        .await
+        .expect("partial policy must evaluate, skipping undefined rules");
+
+        let present: std::collections::HashSet<&str> =
+            result.rules_result.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            present,
+            ["executables", "hardware"]
+                .into_iter()
+                .collect::<std::collections::HashSet<&str>>(),
+            "only defined rules should be present; undefined ones skipped"
+        );
+        assert_eq!(
+            result.rules_result.get("executables").unwrap(),
+            &serde_json::json!(3)
+        );
+        assert_eq!(
+            result.rules_result.get("hardware").unwrap(),
+            &serde_json::json!(2)
+        );
+    }
+}
+
+// ============================================================================
+// Evaluation micro-benchmark.
+//
+// Reproduces the code-review finding that the RegoVM path re-creates an
+// `Engine`, re-loads the same policy/data, and re-compiles an RVM program once
+// per trust-vector rule inside the `evaluation_rules` loop. A default EAR
+// appraisal evaluates 4 rules (`executables`, `hardware`, `configuration`,
+// `file_system`), so the per-rule compile cost is amplified 4× per appraisal.
+//
+// Strategies timed back-to-back in one process on identical inputs:
+//
+//   * `interpreter_baseline` — a faithful in-bench reconstruction of the
+//     origin/main `evaluate_sync` path (build `Engine` once, load policy/data/
+//     input once, loop rules via `engine.eval_rule`). This is the traditional
+//     regorus interpreter the reviewer used as the baseline (~0.67s / 20 runs).
+//
+//   * `regovm_current` — the production `evaluate_with_regovm` (per-rule
+//     `Engine` + policy/data load + `compile_with_entrypoint` + RVM program
+//     compile + fresh `RegoVM`). This is the path the reviewer measured at
+//     ~4.92s / 20 runs (~7.4× slower).
+//
+//   * `regovm_a` — reviewer's first suggestion, applied minimally: hoist the
+//     `Engine` + `add_policy`/`add_data`/wrapper load OUT of the rule loop, but
+//     keep per-rule `compile_with_entrypoint` + `compile_from_policy` (single
+//     entry) unchanged. This preserves the "skip rules not defined in the
+//     policy" contract natively (the per-rule `compile_with_entrypoint` still
+//     throws `not a valid rule path` -> caught -> skip), so it carries NO
+//     behavioral risk. Isolates how much pure load-hoisting recovers.
+//
+//   * `regovm_a_c` — `regovm_a` plus a per-(policy_hash, rule) `Arc<Program>`
+//     cache persisted across evaluations. Cache misses pay the full compile
+//     (and build the `Engine` lazily, only on the first miss); cache hits skip
+//     `Engine`/parse/compile entirely and just `load_program` + run. This
+//     measures the EAR broker's real load (same `default.rego` evaluated
+//     repeatedly): 1 cold eval + 19 cached.
+//
+// `regovm_a` / `regovm_a_c` deliberately do NOT use multi-entry-point compile
+// (`compile_from_policy(&cp, &[all entries])`): that would change the
+// "missing rule -> skip" behavior into "missing rule -> whole compile fails",
+// which is a behavioral regression we are not willing to ship silently.
+//
+// The empty-input scenario (`}`) means no platform block matches; the
+// `query_reference_value` host-await wrapper is still *compiled* (that is the
+// cost being amplified) but host-await I/O is incidental, not the bottleneck.
+//
+// Run: `cargo test -p attestation-service eval_bench_default_policy -- --ignored --nocapture`
+// Benchmarks the regovm optimization (cached vs uncached program runs against
+// the sync-`Engine` interpreter baseline), so it only compiles under
+// `regorus-regovm`. The `interpreter_eval` baseline uses `regorus::Engine`
+// directly, which regorus exposes regardless of our backend feature.
+#[cfg(all(test, feature = "policy-rvps", feature = "regorus-regovm"))]
+mod eval_bench {
+    use super::*;
+    use crate::rvps::test_resolver;
+    use sha2::Digest;
+    use std::time::{Duration, Instant};
+
+    /// The production default EAR policy, the same source `EarAttestationTokenBroker`
+    /// loads as `default.rego`.
+    const DEFAULT_POLICY: &str = include_str!("../../token/ear_default_policy_cpu.rego");
+
+    /// The four AR4SI trustworthiness-claim rules `EarAttestationTokenBroker`
+    /// derives from `TrustVector::new()` (hyphens -> underscores).
+    const TRUST_VECTOR_RULES: &[&str] =
+        &["executables", "hardware", "configuration", "file_system"];
+
+    /// Faithful reconstruction of origin/main's `evaluate_sync`: one `Engine`,
+    /// policy/data/input loaded once, rules evaluated via `engine.eval_rule`.
+    /// This is the "traditional regorus interpreter" baseline.
+    #[allow(dead_code)]
+    fn interpreter_eval(
+        policy: &str,
+        input: &str,
+        policy_id: &str,
+        evaluation_rules: &[String],
+        data: &str,
+    ) -> Result<std::collections::HashMap<String, serde_json::Value>, PolicyError> {
+        let mut engine = regorus::Engine::new();
+        // regorus 0.11 defaults to rego.v1; the production engine sets rego.v0
+        // so legacy `allow { ... }` policies still parse. Match that here.
+        engine.set_rego_v0(true);
+
+        engine
+            .add_policy(policy_id.to_string(), policy.to_string())
+            .map_err(PolicyError::LoadPolicyFailed)?;
+        let data_value =
+            regorus::Value::from_json_str(data).map_err(PolicyError::JsonSerializationFailed)?;
+        engine
+            .add_data(data_value)
+            .map_err(PolicyError::LoadReferenceDataFailed)?;
+        engine
+            .set_input_json(input)
+            .map_err(PolicyError::SetInputDataFailed)?;
+
+        // The default policy references `query_reference_value(...)`. origin/main
+        // registered it as a sync `Engine` extension; the RegoVM path defines it
+        // via the generated host-await wrapper module. The interpreter baseline
+        // must register it too so regorus can resolve the call at compile time.
+        // With the empty test_resolver every key maps to None -> Null, so the
+        // extension returns Null, matching the regovm host-await path exactly.
+        engine
+            .add_extension(
+                "query_reference_value".to_string(),
+                1,
+                Box::new(|_params: Vec<regorus::Value>| Ok(regorus::Value::Null)),
+            )
+            .map_err(PolicyError::EvalPolicyFailed)?;
+
+        let mut rules_result = std::collections::HashMap::new();
+        for rule in evaluation_rules {
+            let whole_rule = format!("data.policy.{rule}");
+            let claim_value = match engine.eval_rule(whole_rule) {
+                Ok(value) => value,
+                Err(error) if error.to_string().contains("not a valid rule path") => {
+                    debug!("Policy `{policy_id}` does not check {rule}");
+                    continue;
+                }
+                Err(error) => return Err(PolicyError::EvalPolicyFailed(error)),
+            };
+            let claim_value = claim_value
+                .to_json_str()
+                .map_err(PolicyError::JsonSerializationFailed)?;
+            let claim_value =
+                serde_json::from_str(&claim_value).map_err(PolicyError::SerdeJsonError)?;
+            rules_result.insert(rule.clone(), claim_value);
+        }
+        Ok(rules_result)
+    }
+
+    /// Build the same `query_reference_value` host-await function the production
+    /// `common_evaluate` registers, so the generated wrapper module is compiled
+    /// on every call — matching real per-appraisal cost.
+    ///
+    /// This is a faithful IN-BENCH reconstruction of the *pre-optimization*
+    /// `evaluate_with_regovm` (per-rule `Engine` + policy/data load +
+    /// `compile_with_entrypoint` + `compile_from_policy` + fresh `RegoVM`). It
+    /// is deliberately independent of the production fn so that production
+    /// refactors (hoist/cache) do not silently change what this strategy
+    /// measures — same approach as `interpreter_eval` reconstructing
+    /// origin/main.
+    async fn regovm_current_eval(
+        policy: &str,
+        input: &str,
+        policy_id: &str,
+        evaluation_rules: Vec<String>,
+        data: String,
+        resolver: Arc<ReferenceValueResolver>,
+    ) -> Result<EvaluationResult, PolicyError> {
+        let (functions, wrapper_module, data_value, input_value, policy_hash) =
+            build_setup(policy, input, &data, resolver)?;
+
+        let mut rules_result = std::collections::HashMap::new();
+        for rule in &evaluation_rules {
+            let entry_point = format!("data.policy.{rule}");
+            // Build the engine PER RULE (the pre-optimization behaviour).
+            let cp = {
+                let mut engine = regorus::Engine::new();
+                engine.set_rego_v0(true);
+                engine
+                    .add_data(data_value.clone())
+                    .map_err(PolicyError::LoadPolicyFailed)?;
+                engine
+                    .add_policy(policy_id.to_string(), policy.to_string())
+                    .map_err(PolicyError::LoadPolicyFailed)?;
+                if let Some(wrapper) = &wrapper_module {
+                    engine
+                        .add_policy(EXTENSIONS_WRAPPER_MODULE_ID.to_string(), wrapper.clone())
+                        .map_err(PolicyError::LoadPolicyFailed)?;
+                }
+                match engine.compile_with_entrypoint(&regorus::Rc::from(entry_point.clone())) {
+                    Ok(cp) => cp,
+                    Err(e) if e.to_string().contains("not a valid rule path") => {
+                        debug!("Policy `{policy_id}` does not check {rule}");
+                        continue;
+                    }
+                    Err(e) => return Err(PolicyError::LoadPolicyFailed(e)),
+                }
+            };
+            let program = Compiler::compile_from_policy(&cp, &[entry_point.as_str()])
+                .map_err(|e| PolicyError::LoadPolicyFailed(e.into()))?;
+            let result_value = run_vm_rule(program, &data_value, &input_value, &functions).await?;
+            let claim = serde_json::from_str(
+                &result_value
+                    .to_json_str()
+                    .map_err(PolicyError::JsonSerializationFailed)?,
+            )
+            .map_err(PolicyError::SerdeJsonError)?;
+            rules_result.insert(rule.clone(), claim);
+        }
+        Ok(EvaluationResult {
+            rules_result,
+            policy_hash,
+        })
+    }
+
+    /// SHA-384 hex digest of the policy source, matching the `policy_hash`
+    /// `evaluate_with_regovm` returns. Used as the cache key for `regovm_a_c`.
+    fn policy_hash(policy: &str) -> String {
+        let mut hasher = sha2::Sha384::new();
+        sha2::Digest::update(&mut hasher, policy);
+        hex::encode(sha2::Digest::finalize(hasher))
+    }
+
+    /// Run a single-entry `Program` on a fresh `RegoVM` with the given data/
+    /// input, driving the suspendable host-await resume loop exactly like the
+    /// production `evaluate_with_regovm` inner loop. Returns the rule's result.
+    async fn run_vm_rule(
+        program: Arc<regorus::rvm::Program>,
+        data_value: &regorus::Value,
+        input_value: &regorus::Value,
+        functions: &HashMap<String, ExtensionFunction>,
+    ) -> Result<regorus::Value, PolicyError> {
+        let mut vm = regorus::rvm::RegoVM::new();
+        vm.load_program(program);
+        vm.set_data(data_value.clone())
+            .map_err(|e| PolicyError::LoadReferenceDataFailed(e.into()))?;
+        vm.set_input(input_value.clone());
+        vm.set_execution_mode(ExecutionMode::Suspendable);
+
+        let _ = vm
+            .execute()
+            .map_err(|e| PolicyError::EvalPolicyFailed(e.into()))?;
+        loop {
+            match vm.execution_state().clone() {
+                ExecutionState::Suspended {
+                    reason:
+                        SuspendReason::HostAwait {
+                            argument,
+                            identifier,
+                            ..
+                        },
+                    ..
+                } => {
+                    let v = dispatch(identifier, argument, functions).await?;
+                    vm.resume(Some(v))
+                        .map_err(|e| PolicyError::EvalPolicyFailed(e.into()))?;
+                }
+                ExecutionState::Completed { result } => break Ok(result),
+                ExecutionState::Error { error } => {
+                    break Err(PolicyError::EvalPolicyFailed(anyhow!(
+                        "RegoVM error: {error}"
+                    )))
+                }
+                other => {
+                    break Err(PolicyError::EvalPolicyFailed(anyhow!(
+                        "unexpected VM state: {other:?}"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Build the shared per-call setup (host-await functions, wrapper module,
+    /// parsed data/input values, policy hash) used by both `regovm_a` and
+    /// `regovm_a_c`.
+    fn build_setup(
+        policy: &str,
+        input: &str,
+        data: &str,
+        resolver: Arc<ReferenceValueResolver>,
+    ) -> Result<
+        (
+            HashMap<String, ExtensionFunction>,
+            Option<String>,
+            regorus::Value,
+            regorus::Value,
+            String,
+        ),
+        PolicyError,
+    > {
+        let mut functions = HashMap::<String, ExtensionFunction>::default();
+        functions.insert(
+            "query_reference_value".to_string(),
+            query_reference_value_extension(resolver),
+        );
+        let wrapper_module = if functions.is_empty() {
+            None
+        } else {
+            Some(build_extensions_module(&functions))
+        };
+        let data_value =
+            regorus::Value::from_json_str(data).map_err(PolicyError::JsonSerializationFailed)?;
+        let input_value =
+            regorus::Value::from_json_str(input).map_err(PolicyError::SetInputDataFailed)?;
+        Ok((
+            functions,
+            wrapper_module,
+            data_value,
+            input_value,
+            policy_hash(policy),
+        ))
+    }
+
+    /// `regovm_a`: hoist `Engine` + policy/data/wrapper load OUT of the rule
+    /// loop; per rule, keep `compile_with_entrypoint` + single-entry
+    /// `compile_from_policy` unchanged (so `not a valid rule path` is still
+    /// caught per-rule -> skip, no behavioral change). No cross-eval caching.
+    async fn regovm_a_eval(
+        policy: &str,
+        input: &str,
+        policy_id: &str,
+        evaluation_rules: &[String],
+        data: &str,
+        resolver: Arc<ReferenceValueResolver>,
+    ) -> Result<EvaluationResult, PolicyError> {
+        let (functions, wrapper_module, data_value, input_value, policy_hash) =
+            build_setup(policy, input, data, resolver)?;
+
+        // Hoisted out of the loop: build the engine and load policy/data once.
+        let mut engine = regorus::Engine::new();
+        engine.set_rego_v0(true);
+        engine
+            .add_data(data_value.clone())
+            .map_err(PolicyError::LoadPolicyFailed)?;
+        engine
+            .add_policy(policy_id.to_string(), policy.to_string())
+            .map_err(PolicyError::LoadPolicyFailed)?;
+        if let Some(wrapper) = &wrapper_module {
+            engine
+                .add_policy(EXTENSIONS_WRAPPER_MODULE_ID.to_string(), wrapper.clone())
+                .map_err(PolicyError::LoadPolicyFailed)?;
+        }
+
+        let mut rules_result = std::collections::HashMap::new();
+        for rule in evaluation_rules {
+            let entry_point = format!("data.policy.{rule}");
+            let cp = match engine.compile_with_entrypoint(&regorus::Rc::from(entry_point.clone())) {
+                Ok(cp) => cp,
+                Err(e) if e.to_string().contains("not a valid rule path") => {
+                    debug!("Policy `{policy_id}` does not check {rule}");
+                    continue;
+                }
+                Err(e) => return Err(PolicyError::LoadPolicyFailed(e)),
+            };
+            let program = Compiler::compile_from_policy(&cp, &[entry_point.as_str()])
+                .map_err(|e| PolicyError::LoadPolicyFailed(e.into()))?;
+            let result_value = run_vm_rule(program, &data_value, &input_value, &functions).await?;
+            let claim = serde_json::from_str(
+                &result_value
+                    .to_json_str()
+                    .map_err(PolicyError::JsonSerializationFailed)?,
+            )
+            .map_err(PolicyError::SerdeJsonError)?;
+            rules_result.insert(rule.clone(), claim);
+        }
+        Ok(EvaluationResult {
+            rules_result,
+            policy_hash,
+        })
+    }
+
+    /// `regovm_a_c`: `regovm_a` plus a per-(policy_hash, rule) `Arc<Program>`
+    /// cache. On a cache miss the `Engine` is built lazily (parse + loads
+    /// happen once, for the first missed rule only); on a hit, skip
+    /// `Engine`/parse/compile entirely and just `load_program` + run.
+    async fn regovm_a_c_eval(
+        policy: &str,
+        input: &str,
+        policy_id: &str,
+        evaluation_rules: &[String],
+        data: &str,
+        resolver: Arc<ReferenceValueResolver>,
+        cache: &mut HashMap<(String, String), Arc<regorus::rvm::Program>>,
+    ) -> Result<EvaluationResult, PolicyError> {
+        let (functions, wrapper_module, data_value, input_value, policy_hash) =
+            build_setup(policy, input, data, resolver)?;
+
+        let mut engine: Option<regorus::Engine> = None;
+        let mut rules_result = std::collections::HashMap::new();
+        for rule in evaluation_rules {
+            let entry_point = format!("data.policy.{rule}");
+            let program = match cache.get(&(policy_hash.clone(), rule.clone())) {
+                Some(p) => p.clone(),
+                None => {
+                    // Build the engine lazily, only on the first cache miss.
+                    if engine.is_none() {
+                        let mut e = regorus::Engine::new();
+                        e.set_rego_v0(true);
+                        e.add_data(data_value.clone())
+                            .map_err(PolicyError::LoadPolicyFailed)?;
+                        e.add_policy(policy_id.to_string(), policy.to_string())
+                            .map_err(PolicyError::LoadPolicyFailed)?;
+                        if let Some(wrapper) = &wrapper_module {
+                            e.add_policy(EXTENSIONS_WRAPPER_MODULE_ID.to_string(), wrapper.clone())
+                                .map_err(PolicyError::LoadPolicyFailed)?;
+                        }
+                        engine = Some(e);
+                    }
+                    let eng = engine.as_mut().unwrap();
+                    let cp = match eng
+                        .compile_with_entrypoint(&regorus::Rc::from(entry_point.clone()))
+                    {
+                        Ok(cp) => cp,
+                        Err(e) if e.to_string().contains("not a valid rule path") => {
+                            debug!("Policy `{policy_id}` does not check {rule}");
+                            continue;
+                        }
+                        Err(e) => return Err(PolicyError::LoadPolicyFailed(e)),
+                    };
+                    let p = Compiler::compile_from_policy(&cp, &[entry_point.as_str()])
+                        .map_err(|e| PolicyError::LoadPolicyFailed(e.into()))?;
+                    cache.insert((policy_hash.clone(), rule.clone()), p.clone());
+                    p
+                }
+            };
+            let result_value = run_vm_rule(program, &data_value, &input_value, &functions).await?;
+            let claim = serde_json::from_str(
+                &result_value
+                    .to_json_str()
+                    .map_err(PolicyError::JsonSerializationFailed)?,
+            )
+            .map_err(PolicyError::SerdeJsonError)?;
+            rules_result.insert(rule.clone(), claim);
+        }
+        Ok(EvaluationResult {
+            rules_result,
+            policy_hash,
+        })
+    }
+
+    /// Returns the wall-clock duration of the measured batch and the last result.
+    async fn time_async<F, Fut>(
+        warmup: usize,
+        iters: usize,
+        thunk: F,
+    ) -> (Duration, EvaluationResult)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<EvaluationResult, PolicyError>>,
+    {
+        for _ in 0..warmup {
+            thunk().await.unwrap();
+        }
+        let start = Instant::now();
+        let mut last = EvaluationResult {
+            rules_result: std::collections::HashMap::new(),
+            policy_hash: String::new(),
+        };
+        for _ in 0..iters {
+            last = thunk().await.unwrap();
+        }
+        (start.elapsed(), last)
+    }
+
+    fn time_sync<F>(
+        warmup: usize,
+        iters: usize,
+        thunk: F,
+    ) -> (
+        Duration,
+        std::collections::HashMap<String, serde_json::Value>,
+    )
+    where
+        F: Fn() -> Result<std::collections::HashMap<String, serde_json::Value>, PolicyError>,
+    {
+        for _ in 0..warmup {
+            thunk().unwrap();
+        }
+        let start = Instant::now();
+        let mut last = std::collections::HashMap::new();
+        for _ in 0..iters {
+            last = thunk().unwrap();
+        }
+        (start.elapsed(), last)
+    }
+
+    #[tokio::test]
+    #[ignore = "perf benchmark: run with --ignored --nocapture"]
+    async fn eval_bench_default_policy() {
+        let policy = DEFAULT_POLICY.to_string();
+        let input = "{}".to_string();
+        let policy_id = "default".to_string();
+        let rules: Vec<String> = TRUST_VECTOR_RULES.iter().map(|s| s.to_string()).collect();
+        let resolver = test_resolver(std::collections::HashMap::new());
+
+        // The default policy uses `query_reference_value(...)` (a host-await
+        // builtin), never the legacy `data.reference` path, so `common_evaluate`
+        // would hand `evaluate_with_regovm` an empty data document. Pin that so
+        // both strategies see the same `data`.
+        assert!(
+            !policy_uses_legacy_reference(&policy).unwrap(),
+            "default policy unexpectedly uses legacy `data.reference`; update the bench"
+        );
+        let data = "{}".to_string();
+
+        const WARMUP: usize = 3;
+        const ITERS: usize = 20;
+        const BATCHES: usize = 3;
+
+        // --- interpreter baseline ---
+        let mut baseline_best = Duration::MAX;
+        let mut baseline_result = std::collections::HashMap::new();
+        for _ in 0..BATCHES {
+            let (t, r) = time_sync(WARMUP, ITERS, || {
+                interpreter_eval(&policy, &input, &policy_id, &rules, &data)
+            });
+            if t < baseline_best {
+                baseline_best = t;
+                baseline_result = r;
+            }
+        }
+
+        // --- regovm current (per-rule Engine + compile) ---
+        let mut regovm_best = Duration::MAX;
+        let mut regovm_result = EvaluationResult {
+            rules_result: std::collections::HashMap::new(),
+            policy_hash: String::new(),
+        };
+        for _ in 0..BATCHES {
+            let (t, r) = time_async(WARMUP, ITERS, || {
+                regovm_current_eval(
+                    &policy,
+                    &input,
+                    &policy_id,
+                    rules.clone(),
+                    data.clone(),
+                    resolver.clone(),
+                )
+            })
+            .await;
+            if t < regovm_best {
+                regovm_best = t;
+                regovm_result = r;
+            }
+        }
+
+        // --- regovm_a (hoist Engine+loads out of loop; no cross-eval cache) ---
+        let mut a_best = Duration::MAX;
+        let mut a_result = EvaluationResult {
+            rules_result: std::collections::HashMap::new(),
+            policy_hash: String::new(),
+        };
+        for _ in 0..BATCHES {
+            let (t, r) = time_async(WARMUP, ITERS, || {
+                regovm_a_eval(&policy, &input, &policy_id, &rules, &data, resolver.clone())
+            })
+            .await;
+            if t < a_best {
+                a_best = t;
+                a_result = r;
+            }
+        }
+
+        // --- regovm_a_c (regovm_a + per-(policy_hash,rule) program cache) ---
+        // Each batch starts cold (empty cache): iter 1 pays the compile, iters
+        // 2..=20 hit the cache. No warmup, so the measured batch captures the
+        // realistic "1 cold + 19 warm" amortized cost.
+        let mut ac_best = Duration::MAX;
+        let mut ac_result = EvaluationResult {
+            rules_result: std::collections::HashMap::new(),
+            policy_hash: String::new(),
+        };
+        for _ in 0..BATCHES {
+            let mut cache: HashMap<(String, String), Arc<regorus::rvm::Program>> = HashMap::new();
+            let start = Instant::now();
+            let mut last = EvaluationResult {
+                rules_result: std::collections::HashMap::new(),
+                policy_hash: String::new(),
+            };
+            for _ in 0..ITERS {
+                last = regovm_a_c_eval(
+                    &policy,
+                    &input,
+                    &policy_id,
+                    &rules,
+                    &data,
+                    resolver.clone(),
+                    &mut cache,
+                )
+                .await
+                .unwrap();
+            }
+            let t = start.elapsed();
+            if t < ac_best {
+                ac_best = t;
+                ac_result = last;
+            }
+        }
+
+        // Correctness: all four RegoVM strategies must agree with the
+        // interpreter baseline on every rule's claim value. (With empty input
+        // every platform block is absent, so all four rules fall to their
+        // `default` AR4SI values: 33/97/36/35.)
+        for (label, result) in [
+            ("regovm_current", &regovm_result),
+            ("regovm_a", &a_result),
+            ("regovm_a_c", &ac_result),
+        ] {
+            assert_eq!(
+                baseline_result
+                    .keys()
+                    .collect::<std::collections::HashSet<_>>(),
+                result
+                    .rules_result
+                    .keys()
+                    .collect::<std::collections::HashSet<_>>(),
+                "{label}: rule set differs from baseline"
+            );
+            for (rule, b) in &baseline_result {
+                let v = result.rules_result.get(rule).unwrap();
+                assert_eq!(
+                    b, v,
+                    "{label}: rule `{rule}` value differs: baseline={b} {label}={v}"
+                );
+            }
+        }
+
+        let baseline_per = baseline_best / ITERS as u32;
+        let regovm_per = regovm_best / ITERS as u32;
+        let a_per = a_best / ITERS as u32;
+        let ac_per = ac_best / ITERS as u32;
+        let ratio = |d: Duration| d.as_secs_f64() / baseline_best.as_secs_f64();
+
+        eprintln!();
+        eprintln!("================ eval_bench_default_policy ================");
+        eprintln!(
+            "policy: default EAR (ear_default_policy_cpu.rego), {} rules",
+            rules.len()
+        );
+        eprintln!("input : {{}} (no platform match; host-await wrapper still compiled)");
+        eprintln!("iters : {ITERS} (best of {BATCHES} batches)");
+        eprintln!("          baseline/regovm_current/regovm_a: {WARMUP} warmup discarded");
+        eprintln!(
+            "          regovm_a_c: 1 cold + {warm} warm per batch (cache reset)",
+            warm = ITERS - 1
+        );
+        eprintln!("----------------------------------------------------------");
+        eprintln!(
+            "{:<22} {:>12} {:>12} {:>10}",
+            "strategy", "total(20)", "mean/eval", "ratio"
+        );
+        eprintln!(
+            "{:<22} {:>10.2}s {:>9.1}ms {:>9.2}x",
+            "interpreter_baseline",
+            baseline_best.as_secs_f64(),
+            baseline_per.as_secs_f64() * 1000.0,
+            1.0
+        );
+        eprintln!(
+            "{:<22} {:>10.2}s {:>9.1}ms {:>9.2}x",
+            "regovm_current",
+            regovm_best.as_secs_f64(),
+            regovm_per.as_secs_f64() * 1000.0,
+            ratio(regovm_best)
+        );
+        eprintln!(
+            "{:<22} {:>10.2}s {:>9.1}ms {:>9.2}x",
+            "regovm_a (hoist)",
+            a_best.as_secs_f64(),
+            a_per.as_secs_f64() * 1000.0,
+            ratio(a_best)
+        );
+        eprintln!(
+            "{:<22} {:>10.2}s {:>9.1}ms {:>9.2}x",
+            "regovm_a_c (hoist+cache)",
+            ac_best.as_secs_f64(),
+            ac_per.as_secs_f64() * 1000.0,
+            ratio(ac_best)
+        );
+        eprintln!("==========================================================");
+        eprintln!("reviewer target: baseline ~0.67s, regovm_current ~4.92s, ratio ~7.4x");
+        eprintln!("regovm_a isolates load-hoisting; regovm_a_c adds cross-eval program cache");
     }
 }

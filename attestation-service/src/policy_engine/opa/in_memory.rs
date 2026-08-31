@@ -21,13 +21,11 @@ pub struct OPAInMemory {
     policies: RwLock<HashMap<String, Vec<u8>>>,
     #[cfg(feature = "policy-artifact-server")]
     artifact_server_client: Arc<artifact_resolve_sdk::Client>,
-    /// Caller-injected host-await functions exposed to rego policy via the
-    /// `__builtin_host_await` wrapper. Generic injection point so a downstream
-    /// crate can supply functions regorus 0.11 lacks by design (e.g.
-    /// `crypto.sha256`). Each entry's key becomes a rego-callable function name
-    /// (dotted keys like `crypto.sha256` are supported by regorus's function
-    /// rule syntax). `None` keeps the legacy behavior (built-ins only).
-    extra_host_await_functions: Option<Vec<(String, super::RegoVmHostAwaitFunction)>>,
+    /// Caller-injected functions exposed to rego policy. Generic injection
+    /// point so a downstream crate can supply functions regorus does not ship
+    /// built-in. Each entry's key becomes a rego-callable function name. `None`
+    /// keeps the built-ins-only behaviour. See [`with_extra_extension_functions`].
+    extra_extension_functions: Option<Vec<(String, super::ExtensionFunction)>>,
 }
 
 impl OPAInMemory {
@@ -56,24 +54,37 @@ impl OPAInMemory {
                 artifact_resolve_sdk::Client::new(artifact_server_address)
                     .map_err(PolicyError::ArtifactServerClientCreationFailed)?,
             ),
-            extra_host_await_functions: None,
+            extra_extension_functions: None,
         })
     }
 
-    /// Inject additional host-await functions callable from rego policy. Each
-    /// `(key, function)` pair registers a rego function named `key` (dotted keys
-    /// such as `crypto.sha256` are accepted) that suspends the VM and resumes it
-    /// with the function's result. User functions are merged after the built-in
-    /// `query_reference_value` / `query_artifact_server` extensions, so a
-    /// colliding key is overridden by the caller's explicit choice.
+    /// Inject additional functions callable from rego policy. Each `(key,
+    /// function)` pair registers a rego function named `key` that policy can
+    /// call to perform work regorus does not ship built-in. User functions are
+    /// merged after the built-in `query_reference_value` /
+    /// `query_artifact_server` extensions, so a colliding key is overridden by
+    /// the caller's explicit choice.
     ///
     /// This is the generic extension point that lets a downstream crate supply
-    /// host functions regorus 0.11 omits by design (e.g. `crypto.sha256`).
-    pub fn with_extra_host_await_functions(
+    /// host functions regorus omits by design.
+    ///
+    /// # Caller responsibility: name legality
+    ///
+    /// The caller **must** ensure each `key` is a legal rego function name (a
+    /// plain identifier, or a dotted path of identifiers such as
+    /// `pkg.func`). The key is interpolated into generated rego source, so an
+    /// illegal or hostile name can break policy compilation or inject rego
+    /// source. Trustees does not validate names here; validate upstream.
+    ///
+    /// Both backends resolve dotted names (e.g. `crypto.sha256`): the
+    /// `regorus-regovm` backend via generated function-rule wrappers, the
+    /// `regorus-interpreter` backend via regorus's `add_extension` path
+    /// resolution.
+    pub fn with_extra_extension_functions(
         mut self,
-        functions: Vec<(String, super::RegoVmHostAwaitFunction)>,
+        functions: Vec<(String, super::ExtensionFunction)>,
     ) -> Self {
-        self.extra_host_await_functions = Some(functions);
+        self.extra_extension_functions = Some(functions);
         self
     }
 }
@@ -119,7 +130,7 @@ impl PolicyEngine for OPAInMemory {
             // The functions are `Arc` handles, so cloning the `Vec` is cheap and
             // lets `evaluate(&self)` hand the injected functions to
             // `common_evaluate` without moving out of `&self`.
-            self.extra_host_await_functions.clone(),
+            self.extra_extension_functions.clone(),
         )
         .await
     }
@@ -248,7 +259,7 @@ mod tests {
 
     #[cfg(feature = "policy-rvps")]
     #[tokio::test]
-    async fn evaluate_with_host_await_reference_value() {
+    async fn evaluate_with_reference_value_extension() {
         use crate::rvps::test_resolver;
         let eng = OPAInMemory::with_raw_default_policy(
             RAW_ALLOW_POLICY,
@@ -279,20 +290,20 @@ allow if {
         );
     }
 
-    // Injects a host-await function under the dotted key `crypto.sha256` (the
-    // name regorus 0.11 lacks by design) and verifies a rego policy can call
-    // `crypto.sha256("abc")` through the existing build_extensions wrapper and
-    // receive the real sha256 hex. This exercises the generic injection point
-    // end-to-end via OPAInMemory::evaluate, including the dotted function-rule
-    // definition that build_extensions emits.
+    // Injects an extension under the dotted key `crypto.sha256` and verifies a
+    // rego policy can call `crypto.sha256("abc")` and receive the real sha256
+    // hex. Runs on both backends: dotted keys resolve on the `regorus-regovm`
+    // backend (via the `build_extensions` function-rule wrappers) AND on the
+    // `regorus-interpreter` backend (regorus resolves a dotted `add_extension`
+    // path to the matching policy call site).
     #[cfg(feature = "policy-rvps")]
     #[tokio::test]
-    async fn evaluate_with_injected_crypto_sha256_dotted_host_await() {
-        use crate::policy_engine::opa::RegoVmHostAwaitFunction;
+    async fn evaluate_with_injected_dotted_extension() {
+        use crate::policy_engine::opa::ExtensionFunction;
         use crate::rvps::test_resolver;
         use sha2::Digest;
 
-        let sha256_fn: RegoVmHostAwaitFunction = Arc::new(|argument: regorus::Value| {
+        let sha256_fn: ExtensionFunction = Arc::new(|argument: regorus::Value| {
             Box::pin(async move {
                 let s = argument.as_string().map_err(|e| {
                     PolicyError::EvalPolicyFailed(anyhow::anyhow!(
@@ -316,7 +327,7 @@ test_hash := crypto.sha256("abc")
             DEFAULT_ARTIFACT_SERVER_ADDRESS,
         )
         .expect("build engine")
-        .with_extra_host_await_functions(vec![("crypto.sha256".to_string(), sha256_fn)]);
+        .with_extra_extension_functions(vec![("crypto.sha256".to_string(), sha256_fn)]);
 
         let res = eng
             .evaluate(
@@ -332,5 +343,52 @@ test_hash := crypto.sha256("abc")
             got.as_str(),
             Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
+    }
+
+    // Mirror of the injection test for the `regorus-interpreter` backend: a
+    // plain (non-dotted) user function registered through the async->sync
+    // `Extension` bridge, called from policy. Verifies `add_extension` wiring
+    // and the `block_on` bridge for caller-injected functions on the legacy
+    // path.
+    #[cfg(all(feature = "policy-rvps", feature = "regorus-interpreter"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn evaluate_with_injected_plain_extension_interpreter() {
+        use crate::policy_engine::opa::ExtensionFunction;
+        use crate::rvps::test_resolver;
+
+        let upper_fn: ExtensionFunction = Arc::new(|argument: regorus::Value| {
+            Box::pin(async move {
+                let s = argument.as_string().map_err(|e| {
+                    PolicyError::EvalPolicyFailed(anyhow::anyhow!("my_upper arg not a string: {e}"))
+                })?;
+                Ok(regorus::Value::String(s.to_uppercase().into()))
+            })
+        });
+        let policy = r#"package policy
+import rego.v1
+test_upper := my_upper("abc")
+"#;
+        let eng = OPAInMemory::with_raw_default_policy(
+            policy,
+            "default",
+            DEFAULT_ARTIFACT_SERVER_ADDRESS,
+        )
+        .expect("build engine")
+        .with_extra_extension_functions(vec![("my_upper".to_string(), upper_fn)]);
+
+        let res = eng
+            .evaluate(
+                "{}",
+                "default",
+                vec!["test_upper".to_string()],
+                test_resolver(HashMap::new()),
+            )
+            .await
+            .expect("evaluate");
+        let got = res
+            .rules_result
+            .get("test_upper")
+            .expect("test_upper result");
+        assert_eq!(got.as_str(), Some("ABC"));
     }
 }

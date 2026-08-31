@@ -4,8 +4,16 @@
 
 use anyhow::{anyhow, Result};
 use log::debug;
+#[cfg(feature = "regorus-regovm")]
 use regorus::languages::rego::compiler::Compiler;
+// The legacy interpreter backend exposes host functions through regorus's
+// sync `Extension` trait; the RVM backend drives them through the suspendable
+// host-call loop. Only the one compiled for the active backend is needed.
+#[cfg(feature = "regorus-regovm")]
 use regorus::rvm::vm::{ExecutionMode, ExecutionState, SuspendReason};
+#[cfg(feature = "regorus-interpreter")]
+use regorus::Extension;
+#[cfg(feature = "regorus-regovm")]
 use regorus::Rc;
 use sha2::Digest;
 use std::collections::HashMap;
@@ -24,6 +32,29 @@ use std::time::Duration;
 use crate::rvps::ReferenceValueResolver;
 
 use super::{EvaluationResult, PolicyError};
+
+// Exactly one policy execution backend must be enabled. The two are mutually
+// exclusive and together exhaustive: `regorus-interpreter` is the stable legacy
+// path (sync `Engine` + `Extension`s via `spawn_blocking`); `regorus-regovm`
+// is the unstable Regorus VM suspendable host-call path. The public interface
+// (`ExtensionFunction` / `with_extra_extension_functions`) is identical under
+// either, so downstream code is unaffected by the choice.
+#[cfg(all(feature = "regorus-regovm", feature = "regorus-interpreter"))]
+compile_error!(
+    "features `regorus-regovm` and `regorus-interpreter` are mutually exclusive; enable exactly one"
+);
+#[cfg(not(any(feature = "regorus-regovm", feature = "regorus-interpreter")))]
+compile_error!("exactly one of `regorus-regovm` / `regorus-interpreter` must be enabled");
+// The legacy interpreter backend relies on a multi-threaded tokio runtime
+// (`Handle::current` + `spawn_blocking` + `block_on`) and cannot run on the
+// single-threaded wasm32 target; there only `regorus-regovm` is available.
+#[cfg(all(
+    feature = "regorus-interpreter",
+    target_arch = "wasm32",
+    target_vendor = "unknown",
+    target_os = "unknown"
+))]
+compile_error!("`regorus-interpreter` backend is unavailable on wasm32; use `regorus-regovm`");
 
 #[cfg(feature = "fs")]
 mod fs;
@@ -98,16 +129,27 @@ fn policy_uses_legacy_reference(policy: &str) -> Result<bool, PolicyError> {
     Ok(dotted || indexed)
 }
 
+/// A host-supplied function callable from rego policy under either execution
+/// backend. The caller provides `Vec<(String, ExtensionFunction)>` via
+/// [`OPAInMemory::with_extra_extension_functions`](in_memory::OPAInMemory::with_extra_extension_functions);
+/// each pair registers a rego function named after the key that policy can call
+/// to perform work regorus does not ship built-in (e.g. an RVPS lookup, an
+/// artifact-server resolve, or any downstream host function). The same async
+/// closure type serves both backends:
+/// - `regorus-regovm`: the VM suspends on `__builtin_host_await` and the host
+///   resumes it with the closure's result;
+/// - `regorus-interpreter`: the closure is wrapped in a sync regorus `Extension`
+///   that `block_on`s it on a blocking thread.
 // On wasm32 the RVPS resolver returns `?Send` futures (single-threaded async,
-// matching `RvpsApi`'s `async_trait(?Send)` cfg), so the host-await closure and
-// its future drop the `Send` bound. Everywhere else `Send` is required because
-// RegoVM runs on a multi-threaded tokio runtime.
+// matching `RvpsApi`'s `async_trait(?Send)` cfg), so the closure and its
+// future drop the `Send` bound. Everywhere else `Send` is required because
+// the multi-threaded tokio runtime (interpreter) or the VM (regovm) needs it.
 #[cfg(all(
     target_arch = "wasm32",
     target_vendor = "unknown",
     target_os = "unknown"
 ))]
-pub type RegoVmHostAwaitFunction = Arc<
+pub type ExtensionFunction = Arc<
     dyn Fn(
             regorus::Value,
         )
@@ -121,7 +163,7 @@ pub type RegoVmHostAwaitFunction = Arc<
     target_vendor = "unknown",
     target_os = "unknown"
 )))]
-pub type RegoVmHostAwaitFunction = Arc<
+pub type ExtensionFunction = Arc<
     dyn Fn(
             /* argument */ regorus::Value,
         )
@@ -133,7 +175,7 @@ pub type RegoVmHostAwaitFunction = Arc<
 #[cfg(feature = "policy-rvps")]
 fn query_reference_value_extension(
     reference_value_resolver: Arc<ReferenceValueResolver>,
-) -> RegoVmHostAwaitFunction {
+) -> ExtensionFunction {
     Arc::new(move |argument| {
         let reference_value_resolver = reference_value_resolver.clone();
         Box::pin(async move {
@@ -184,7 +226,7 @@ fn query_reference_value_extension(
 #[cfg(feature = "policy-artifact-server")]
 fn query_artifact_server_extension(
     artifact_server_client: Arc<artifact_resolve_sdk::Client>,
-) -> RegoVmHostAwaitFunction {
+) -> ExtensionFunction {
     Arc::new(move |argument| {
         let artifact_server_client = artifact_server_client.clone();
         Box::pin(async move {
@@ -245,7 +287,7 @@ async fn common_evaluate(
     #[cfg(feature = "policy-artifact-server")] artifact_server_client: Arc<
         artifact_resolve_sdk::Client,
     >,
-    extra_host_await_functions: Option<Vec<(String, RegoVmHostAwaitFunction)>>,
+    extra_extension_functions: Option<Vec<(String, ExtensionFunction)>>,
 ) -> Result<EvaluationResult, PolicyError> {
     // Legacy policies read reference values from data.reference; fetch them via
     // the resolver. All other policies get an empty data document.
@@ -260,11 +302,11 @@ async fn common_evaluate(
     };
 
     #[allow(unused_mut)]
-    let mut regovm_host_await_functions = HashMap::<String, RegoVmHostAwaitFunction>::default();
+    let mut extension_functions = HashMap::<String, ExtensionFunction>::default();
 
     #[cfg(feature = "policy-rvps")]
     {
-        regovm_host_await_functions.insert(
+        extension_functions.insert(
             "query_reference_value".to_string(),
             query_reference_value_extension(reference_value_resolver),
         );
@@ -272,42 +314,56 @@ async fn common_evaluate(
 
     #[cfg(feature = "policy-artifact-server")]
     {
-        regovm_host_await_functions.insert(
+        extension_functions.insert(
             "query_artifact_server".to_string(),
             query_artifact_server_extension(artifact_server_client),
         );
     }
 
-    // Merge caller-injected host-await functions after the built-ins. This is the
-    // generic injection point that lets a downstream crate (e.g. TNG) supply
-    // arbitrary host functions callable from rego — notably `crypto.sha256`
-    // (a dotted key), since regorus 0.11 ships no `crypto.*` builtins by design.
-    // User functions are inserted last so a key colliding with a built-in is
+    // Merge caller-injected functions after the built-ins. This is the generic
+    // extension point that lets a downstream crate supply arbitrary host
+    // functions callable from rego that regorus does not ship built-in. User
+    // functions are inserted last so a key colliding with a built-in is
     // overridden by the caller's explicit choice.
-    if let Some(extras) = extra_host_await_functions {
+    if let Some(extras) = extra_extension_functions {
         for (key, function) in extras {
-            regovm_host_await_functions.insert(key, function);
+            extension_functions.insert(key, function);
         }
     }
 
-    evaluate_with_regovm(
+    // Dispatch to the selected backend. Exactly one of the two features is on
+    // (enforced by the compile_error guards at the top of this file), so only
+    // one branch is compiled.
+    #[cfg(feature = "regorus-regovm")]
+    return evaluate_with_regovm(
         policy,
         input,
         policy_id,
         evaluation_rules,
         data,
-        regovm_host_await_functions,
+        extension_functions,
     )
-    .await
+    .await;
+    #[cfg(feature = "regorus-interpreter")]
+    return evaluate_with_interpreter(
+        policy,
+        input,
+        policy_id,
+        evaluation_rules,
+        data,
+        extension_functions,
+    )
+    .await;
 }
 
+#[cfg(feature = "regorus-regovm")]
 async fn evaluate_with_regovm(
     policy: String,
     input: String,
     policy_id: String,
     evaluation_rules: Vec<String>,
     data: String,
-    regovm_host_await_functions: HashMap<String, RegoVmHostAwaitFunction>,
+    extension_functions: HashMap<String, ExtensionFunction>,
 ) -> Result<EvaluationResult, PolicyError> {
     let policy_hash = {
         let mut hasher = sha2::Sha384::new();
@@ -315,15 +371,15 @@ async fn evaluate_with_regovm(
         hex::encode(hasher.finalize())
     };
 
-    // Emit the host-await wrappers as a *separate* rego.v1 module (see
+    // Emit the extension wrappers as a *separate* rego.v1 module (see
     // [`build_extensions_module`]) rather than concatenating them onto the
     // user policy. This keeps legacy rego.v0 policies parseable: the user
     // module (no `import rego.v1`) parses in v0 mode while the wrapper module
-    // parses in v1 mode. Skip it when no host-await functions are registered.
-    let wrapper_module = if regovm_host_await_functions.is_empty() {
+    // parses in v1 mode. Skip it when no extension functions are registered.
+    let wrapper_module = if extension_functions.is_empty() {
         None
     } else {
-        Some(build_extensions_module(&regovm_host_await_functions))
+        Some(build_extensions_module(&extension_functions))
     };
 
     let data_value =
@@ -353,7 +409,7 @@ async fn evaluate_with_regovm(
                 .map_err(PolicyError::LoadPolicyFailed)?;
             if let Some(wrapper) = &wrapper_module {
                 engine
-                    .add_policy(HOST_AWAIT_WRAPPER_MODULE_ID.to_string(), wrapper.clone())
+                    .add_policy(EXTENSIONS_WRAPPER_MODULE_ID.to_string(), wrapper.clone())
                     .map_err(PolicyError::LoadPolicyFailed)?;
             }
             match engine.compile_with_entrypoint(&Rc::from(entry_point.clone())) {
@@ -392,7 +448,7 @@ async fn evaluate_with_regovm(
                         },
                     ..
                 } => {
-                    let v = dispatch(identifier, argument, &regovm_host_await_functions).await?;
+                    let v = dispatch(identifier, argument, &extension_functions).await?;
                     vm.resume(Some(v))
                         .map_err(|e| PolicyError::EvalPolicyFailed(e.into()))?;
                 }
@@ -425,36 +481,165 @@ async fn evaluate_with_regovm(
     })
 }
 
-/// Route a suspended VM's argument to the matching async resolver, keyed by identifier.
+// === Legacy interpreter backend ==============================================
+// The stable path: the sync regorus `Engine` + `Extension`s, driven via
+// `tokio::task::spawn_blocking` so each extension's `block_on` lands on a
+// blocking-pool thread (never nesting the tokio runtime). The same async
+// `ExtensionFunction` closures the regovm backend drives through its suspend
+// loop are reused here unchanged -- [`async_to_sync_extension`] adapts each
+// into a sync regorus `Extension` that `block_on`s the closure's future.
+// ==========================================================================
+
+#[cfg(feature = "regorus-interpreter")]
+async fn evaluate_with_interpreter(
+    policy: String,
+    input: String,
+    policy_id: String,
+    evaluation_rules: Vec<String>,
+    data: String,
+    extension_functions: HashMap<String, ExtensionFunction>,
+) -> Result<EvaluationResult, PolicyError> {
+    // Captured on the async thread, then moved onto a blocking-pool thread so
+    // the extensions' `block_on` never runs inside a runtime context guard.
+    let runtime_handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        evaluate_sync(
+            policy,
+            input,
+            policy_id,
+            evaluation_rules,
+            data,
+            extension_functions,
+            runtime_handle,
+        )
+    })
+    .await
+    .map_err(|e| {
+        PolicyError::EvalPolicyFailed(anyhow!("Regorus blocking evaluation task failed: {e}"))
+    })?
+}
+
+#[cfg(feature = "regorus-interpreter")]
+fn evaluate_sync(
+    policy: String,
+    input: String,
+    policy_id: String,
+    evaluation_rules: Vec<String>,
+    data: String,
+    extension_functions: HashMap<String, ExtensionFunction>,
+    runtime_handle: tokio::runtime::Handle,
+) -> Result<EvaluationResult, PolicyError> {
+    let policy_hash = {
+        let mut hasher = sha2::Sha384::new();
+        hasher.update(&policy);
+        hex::encode(hasher.finalize())
+    };
+
+    let mut engine = regorus::Engine::new();
+    // regorus 0.11 defaults to rego.v1; keep accepting legacy `allow { ... }`
+    // (rego.v0) policies saved before the rego.v1 migration. `import rego.v1`
+    // policies still work.
+    engine.set_rego_v0(true);
+    engine
+        .add_policy(policy_id.clone(), policy)
+        .map_err(PolicyError::LoadPolicyFailed)?;
+    let data_value =
+        regorus::Value::from_json_str(&data).map_err(PolicyError::JsonSerializationFailed)?;
+    engine
+        .add_data(data_value)
+        .map_err(PolicyError::LoadReferenceDataFailed)?;
+    engine
+        .set_input_json(&input)
+        .map_err(PolicyError::SetInputDataFailed)?;
+
+    for (name, function) in &extension_functions {
+        engine
+            .add_extension(
+                name.clone(),
+                1,
+                async_to_sync_extension(function.clone(), runtime_handle.clone()),
+            )
+            .map_err(PolicyError::EvalPolicyFailed)?;
+    }
+
+    let mut rules_result = std::collections::HashMap::new();
+    for rule in evaluation_rules {
+        // regorus rejects a bare rule name with "not a valid rule path"; use
+        // the full data.policy path.
+        let whole_rule = format!("data.policy.{rule}");
+        let claim_value = match engine.eval_rule(whole_rule) {
+            Ok(value) => value,
+            Err(error) if error.to_string().contains("not a valid rule path") => {
+                debug!("Policy `{policy_id}` does not check {rule}");
+                continue;
+            }
+            Err(error) => return Err(PolicyError::EvalPolicyFailed(error)),
+        };
+        let claim_value = claim_value
+            .to_json_str()
+            .map_err(PolicyError::JsonSerializationFailed)?;
+        let claim_value =
+            serde_json::from_str(&claim_value).map_err(PolicyError::SerdeJsonError)?;
+        rules_result.insert(rule, claim_value);
+    }
+
+    Ok(EvaluationResult {
+        rules_result,
+        policy_hash,
+    })
+}
+
+/// Bridge an async [`ExtensionFunction`] into the sync `regorus::Extension`
+/// the interpreter backend expects: drive the closure's future to completion
+/// on the captured tokio runtime handle. Called from a `spawn_blocking`
+/// thread, so `block_on` does not nest the runtime.
+#[cfg(feature = "regorus-interpreter")]
+fn async_to_sync_extension(
+    function: ExtensionFunction,
+    runtime_handle: tokio::runtime::Handle,
+) -> Box<dyn Extension> {
+    Box::new(move |params: Vec<regorus::Value>| {
+        if params.len() != 1 {
+            return Err(anyhow!(
+                "extension expects exactly 1 argument, got {}",
+                params.len()
+            ));
+        }
+        let argument = params[0].clone();
+        let future = function(argument);
+        runtime_handle.block_on(future).map_err(anyhow::Error::new)
+    })
+}
+/// by the identifier the VM passed to `__builtin_host_await`.
+#[cfg(feature = "regorus-regovm")]
 async fn dispatch(
     identifier: regorus::Value,
     argument: regorus::Value,
-    regovm_host_await_functions: &HashMap<String, RegoVmHostAwaitFunction>,
+    extension_functions: &HashMap<String, ExtensionFunction>,
 ) -> Result<regorus::Value, PolicyError> {
     let id = identifier.as_string().map_err(|e| {
-        PolicyError::EvalPolicyFailed(anyhow!("host await identifier not a string: {e}"))
+        PolicyError::EvalPolicyFailed(anyhow!("extension identifier not a string: {e}"))
     })?;
 
-    match regovm_host_await_functions.get(id.as_ref()) {
+    match extension_functions.get(id.as_ref()) {
         Some(function) => function(argument).await,
         None => Err(PolicyError::EvalPolicyFailed(anyhow!(
-            "unknown host await identifier: {id}"
+            "unknown extension function: {id}"
         ))),
     }
 }
 
-/// Host-await wrapper appended to every policy source. Dynamically generates
-/// a Rego function for each registered host-await extension, rewriting the
-/// friendly builtin name onto the native `__builtin_host_await`, which
-/// suspends the VM so the host can run async I/O and resume it. Uses `if` +
-/// `:=` (rego.v1 syntax) and no `import rego.v1` -- see
+/// Per-key rego wrappers appended to the policy source on the regovm backend.
+/// Dynamically generates a rego function for each registered extension,
+/// forwarding the friendly name onto regorus's native `__builtin_host_await`
+/// primitive, which suspends the VM so the host can run async I/O and resume it.
+/// Uses `if` + `:=` (rego.v1 syntax) and no `import rego.v1` -- see
 /// [`build_extensions_module`], which wraps these definitions in their own
 /// rego.v1 module.
-fn build_extensions(
-    regovm_host_await_functions: &HashMap<String, RegoVmHostAwaitFunction>,
-) -> String {
+#[cfg(feature = "regorus-regovm")]
+fn build_extensions(extension_functions: &HashMap<String, ExtensionFunction>) -> String {
     let mut ext = String::from(r#"# === trustee EXTENSIONS (generated) ==="#);
-    for key in regovm_host_await_functions.keys() {
+    for key in extension_functions.keys() {
         ext.push_str(&format!(
             r#"
 {key}(arg) := v if {{ v := __builtin_host_await(arg, "{key}") }}
@@ -464,11 +649,12 @@ fn build_extensions(
     ext
 }
 
-/// Module id under which the generated host-await wrappers are loaded, so they
+/// Module id under which the generated extension wrappers are loaded, so they
 /// form a distinct module from the user-supplied policy.
-const HOST_AWAIT_WRAPPER_MODULE_ID: &str = "__trustee_host_await_extensions__.rego";
+#[cfg(feature = "regorus-regovm")]
+const EXTENSIONS_WRAPPER_MODULE_ID: &str = "__trustee_extensions__.rego";
 
-/// Wrap the generated host-await function definitions in their own rego.v1
+/// Wrap the generated extension function definitions in their own rego.v1
 /// module (own `package` + `import rego.v1`). Keeping them separate from the
 /// user policy lets a legacy rego.v0 policy (no `import rego.v1`) parse in v0
 /// mode while the wrappers still parse in v1 mode: the regorus parser picks
@@ -476,12 +662,11 @@ const HOST_AWAIT_WRAPPER_MODULE_ID: &str = "__trustee_host_await_extensions__.re
 /// but a single shared module cannot mix dialects, so concatenating v1-syntax
 /// wrappers onto a v0 policy would force the whole module into v1 and reject
 /// legacy `allow { ... }` bodies.
-fn build_extensions_module(
-    regovm_host_await_functions: &HashMap<String, RegoVmHostAwaitFunction>,
-) -> String {
+#[cfg(feature = "regorus-regovm")]
+fn build_extensions_module(extension_functions: &HashMap<String, ExtensionFunction>) -> String {
     format!(
         "package policy\nimport rego.v1\n\n{}",
-        build_extensions(regovm_host_await_functions)
+        build_extensions(extension_functions)
     )
 }
 
@@ -788,12 +973,12 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
         assert!(eval_allow_v0_mode(policy).is_err());
     }
 
-    #[cfg(feature = "policy-rvps")]
+    #[cfg(all(feature = "policy-rvps", feature = "regorus-regovm"))]
     #[tokio::test]
     async fn dispatch_routes_reference_value_lookup_and_returns_null_when_missing() {
         use crate::rvps::test_resolver;
         let rvps = test_resolver(std::collections::HashMap::from([]));
-        let mut functions = HashMap::<String, RegoVmHostAwaitFunction>::new();
+        let mut functions = HashMap::<String, ExtensionFunction>::new();
         functions.insert(
             "query_reference_value".to_string(),
             query_reference_value_extension(rvps),
@@ -804,17 +989,19 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
         assert!(matches!(v, regorus::Value::Null));
     }
 
+    #[cfg(feature = "regorus-regovm")]
     #[tokio::test]
     async fn dispatch_unknown_identifier_errors() {
-        let functions = HashMap::<String, RegoVmHostAwaitFunction>::new();
+        let functions = HashMap::<String, ExtensionFunction>::new();
         let id = regorus::Value::String(regorus::Rc::from("nope"));
         let arg = regorus::Value::Null;
         assert!(dispatch(id, arg, &functions).await.is_err());
     }
 
+    #[cfg(feature = "regorus-regovm")]
     #[tokio::test]
     async fn dispatch_passes_argument_to_registered_function() {
-        let mut functions = HashMap::<String, RegoVmHostAwaitFunction>::new();
+        let mut functions = HashMap::<String, ExtensionFunction>::new();
         functions.insert(
             "echo".to_string(),
             Arc::new(|argument| Box::pin(async move { Ok::<_, PolicyError>(argument) })),
@@ -828,23 +1015,25 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
         }
     }
 
+    #[cfg(feature = "regorus-regovm")]
     #[test]
     fn build_extensions_empty_returns_only_header() {
-        let functions = HashMap::<String, RegoVmHostAwaitFunction>::new();
+        let functions = HashMap::<String, ExtensionFunction>::new();
         assert_eq!(
             build_extensions(&functions),
             "# === trustee EXTENSIONS (generated) ==="
         );
     }
 
+    #[cfg(feature = "regorus-regovm")]
     #[test]
-    fn build_extensions_generates_host_await_wrapper_per_registered_key() {
-        let make = || -> RegoVmHostAwaitFunction {
+    fn build_extensions_generates_wrapper_per_registered_key() {
+        let make = || -> ExtensionFunction {
             Arc::new(|_a: regorus::Value| {
                 Box::pin(async { Ok::<_, PolicyError>(regorus::Value::Null) })
             })
         };
-        let mut functions = HashMap::<String, RegoVmHostAwaitFunction>::new();
+        let mut functions = HashMap::<String, ExtensionFunction>::new();
         functions.insert("alpha".to_string(), make());
         functions.insert("beta".to_string(), make());
         let ext = build_extensions(&functions);
@@ -858,17 +1047,19 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
         );
     }
 
-    // Host-await closure that always returns a fixed value, ignoring its argument.
-    fn fixed_value_extension(value: regorus::Value) -> RegoVmHostAwaitFunction {
+    // Extension closure that always returns a fixed value, ignoring its argument.
+    #[cfg(feature = "regorus-regovm")]
+    fn fixed_value_extension(value: regorus::Value) -> ExtensionFunction {
         Arc::new(move |_argument| {
             let value = value.clone();
             Box::pin(async move { Ok(value) })
         })
     }
 
-    // Host-await closure mapping a string argument to a number ("a"->1, "b"->2),
+    // Extension closure mapping a string argument to a number ("a"->1, "b"->2),
     // else null. Used to verify the VM forwards the policy argument to the host.
-    fn lookup_extension() -> RegoVmHostAwaitFunction {
+    #[cfg(feature = "regorus-regovm")]
+    fn lookup_extension() -> ExtensionFunction {
         Arc::new(move |argument| {
             Box::pin(async move {
                 let key = argument.as_string().map_err(|e| {
@@ -883,9 +1074,10 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
         })
     }
 
-    // Host-await closure that always fails, to exercise error propagation from a
+    // Extension closure that always fails, to exercise error propagation from a
     // suspended host call back up through evaluate_with_regovm.
-    fn failing_extension() -> RegoVmHostAwaitFunction {
+    #[cfg(feature = "regorus-regovm")]
+    fn failing_extension() -> ExtensionFunction {
         Arc::new(move |_argument| {
             Box::pin(async move {
                 Err(PolicyError::EvalPolicyFailed(anyhow!(
@@ -895,10 +1087,11 @@ allow = query_artifact_server({"tdx.td-shim": "582f8ed2"})
         })
     }
 
+    #[cfg(feature = "regorus-regovm")]
     #[tokio::test]
     async fn evaluate_with_regovm_async_builtin_drives_rule_true() {
-        // A policy calls a host-await builtin whose returned value satisfies the
-        // rule body, so the rule evaluates to true. Exercises the full
+        // A policy calls an extension whose returned value satisfies the rule
+        // body, so the rule evaluates to true. Exercises the full
         // compile -> suspend -> host resume -> complete loop.
         let mut functions = HashMap::new();
         functions.insert(
@@ -927,6 +1120,7 @@ allow if {
         );
     }
 
+    #[cfg(feature = "regorus-regovm")]
     #[tokio::test]
     async fn evaluate_with_regovm_async_builtin_receives_policy_argument() {
         // The policy calls the same builtin twice with different arguments and
@@ -957,6 +1151,7 @@ allow if {
         );
     }
 
+    #[cfg(feature = "regorus-regovm")]
     #[tokio::test]
     async fn evaluate_with_regovm_async_builtin_null_satisfies_rule() {
         // A builtin returning null (unknown key) is compared against null in the
@@ -986,9 +1181,10 @@ allow if {
         );
     }
 
+    #[cfg(feature = "regorus-regovm")]
     #[tokio::test]
     async fn evaluate_with_regovm_propagates_async_builtin_error() {
-        // A failing host-await call must surface as a PolicyError from
+        // A failing extension call must surface as a PolicyError from
         // evaluate_with_regovm, not panic or be silently swallowed.
         let mut functions = HashMap::new();
         functions.insert("failing".to_string(), failing_extension());

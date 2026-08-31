@@ -12,7 +12,24 @@ default = [
     "fs",
     "policy-rvps",
     "policy-artifact-server",
+    "regorus-interpreter",
 ]
+
+# Policy execution backend. Exactly one must be enabled (enforced at compile
+# time in src/policy_engine/opa/mod.rs); enabling neither or both is a
+# compile_error. The two backends expose the same public interface
+# (`ExtensionFunction` / `with_extra_extension_functions`) so downstream code
+# is identical regardless of which is selected.
+#
+# `regorus-interpreter` (the default) is the stable legacy path: the sync
+# regorus `Engine` + `Extension`s, driven via `tokio::task::spawn_blocking`
+# so the extensions' `block_on` never nests the runtime. Non-wasm only.
+#
+# `regorus-regovm` selects the (still unstable) Regorus VM suspendable
+# host-call path (`__builtin_host_await` + `ExecutionMode::Suspendable`),
+# which needs no tokio runtime and works on wasm32.
+regorus-interpreter = []
+regorus-regovm = []
 
 # Filesystem-backed implementations: config-from-file, on-disk OPA policy engine,
 # rvps local_json/local_fs storage, nonce-key persistence, signer transparency
